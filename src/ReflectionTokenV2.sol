@@ -65,7 +65,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(address => address) public pairRouter;
 
     mapping(address => bool) public backingTokenAllowed;
-    address public buybackWbtc;
+    address public buybackAnkrBnb;
     address public buybackRouter;
 
     struct PoolConfig {
@@ -90,8 +90,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     bool private _inSwap;
 
     uint256 public buybackCooldownSeconds = 1 hours;
-    uint256 public maxBuybackWbtc;
-    uint256 public buybackUpperLimitWbtc;
+    uint256 public maxBuybackAnkrBnb;
+    uint256 public buybackUpperLimitAnkrBnb;
     uint256 public lastBuybackTimestamp;
 
     event FeesUpdated(uint16 reflectionFeeBps, uint16 liquidityFeeBps, uint16 buybackFeeBps);
@@ -191,10 +191,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         backingTokenAllowed[token] = allowed;
     }
 
-    function setBuybackWbtc(address wbtc) external onlyOwner {
-        require(buybackWbtc == address(0), "Buyback token set");
-        require(backingTokenAllowed[wbtc], "Token not allowed");
-        buybackWbtc = wbtc;
+    function setBuybackAnkrBnb(address ankrBnb) external onlyOwner {
+        require(buybackAnkrBnb == address(0), "Buyback token set");
+        require(backingTokenAllowed[ankrBnb], "Token not allowed");
+        buybackAnkrBnb = ankrBnb;
     }
 
     function setBuybackRouter(address router) external onlyOwner {
@@ -233,8 +233,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit) external onlyOwner {
         buybackCooldownSeconds = cooldownSeconds;
-        maxBuybackWbtc = maxPerCall;
-        buybackUpperLimitWbtc = upperLimit;
+        maxBuybackAnkrBnb = maxPerCall;
+        buybackUpperLimitAnkrBnb = upperLimit;
     }
 
     function poolCount() external view returns (uint256) {
@@ -447,10 +447,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function _processBuybackSwap(uint256 tokenAmount) internal returns (uint256 used) {
-        if (tokenAmount == 0 || buybackWbtc == address(0) || buybackRouter == address(0)) {
+        if (tokenAmount == 0 || buybackAnkrBnb == address(0) || buybackRouter == address(0)) {
             return 0;
         }
-        if (!_swapTokensForBacking(buybackRouter, buybackWbtc, tokenAmount)) {
+        if (!_swapTokensForBacking(buybackRouter, buybackAnkrBnb, tokenAmount)) {
             return 0;
         }
         used = tokenAmount;
@@ -458,39 +458,39 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function _executeBuyback() internal {
-        if (buybackWbtc == address(0) || buybackRouter == address(0)) {
+        if (buybackAnkrBnb == address(0) || buybackRouter == address(0)) {
             return;
         }
         if (block.timestamp < lastBuybackTimestamp + buybackCooldownSeconds) {
             return;
         }
-        uint256 wbtcBalance = IERC20(buybackWbtc).balanceOf(address(this));
-        if (wbtcBalance == 0) {
+        uint256 ankrBnbBalance = IERC20(buybackAnkrBnb).balanceOf(address(this));
+        if (ankrBnbBalance == 0) {
             return;
         }
-        if (buybackUpperLimitWbtc > 0 && wbtcBalance > buybackUpperLimitWbtc) {
-            wbtcBalance = buybackUpperLimitWbtc;
+        if (buybackUpperLimitAnkrBnb > 0 && ankrBnbBalance > buybackUpperLimitAnkrBnb) {
+            ankrBnbBalance = buybackUpperLimitAnkrBnb;
         }
-        if (maxBuybackWbtc > 0 && wbtcBalance > maxBuybackWbtc) {
-            wbtcBalance = maxBuybackWbtc;
+        if (maxBuybackAnkrBnb > 0 && ankrBnbBalance > maxBuybackAnkrBnb) {
+            ankrBnbBalance = maxBuybackAnkrBnb;
         }
-        if (wbtcBalance == 0) {
+        if (ankrBnbBalance == 0) {
             return;
         }
         address[] memory path = new address[](2);
-        path[0] = buybackWbtc;
+        path[0] = buybackAnkrBnb;
         path[1] = address(this);
-        uint256 amountOutMin = _quoteAmountOutMin(buybackRouter, wbtcBalance, path);
+        uint256 amountOutMin = _quoteAmountOutMin(buybackRouter, ankrBnbBalance, path);
         if (amountOutMin == 0) {
             return;
         }
-        IERC20(buybackWbtc).approve(buybackRouter, wbtcBalance);
+        IERC20(buybackAnkrBnb).approve(buybackRouter, ankrBnbBalance);
         try IUniswapV2Router02(buybackRouter)
             .swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                wbtcBalance, amountOutMin, path, DEAD, block.timestamp
+                ankrBnbBalance, amountOutMin, path, DEAD, block.timestamp
             ) {
             lastBuybackTimestamp = block.timestamp;
-            emit Buyback(buybackRouter, wbtcBalance);
+            emit Buyback(buybackRouter, ankrBnbBalance);
         } catch {
             return;
         }
