@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {MockERC20} from "./MockERC20.sol";
-
 interface IERC20Minimal {
     function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     function transfer(address recipient, uint256 amount) external returns (bool);
@@ -18,8 +16,12 @@ contract MockRouter {
     uint256 public lastAmountOutMin;
     address public lastSwapTokenIn;
     address public lastSwapTokenOut;
+    address public lastSwapTo;
     address public lastAddLiquidityTokenA;
     address public lastAddLiquidityTokenB;
+    address public lastAddLiquidityTo;
+
+    bytes32[] public swapPathHashes;
 
     constructor(address factory_) {
         factory = factory_;
@@ -36,6 +38,14 @@ contract MockRouter {
 
     function setQuotedAmountOut(uint256 amountOut) external {
         quotedAmountOut = amountOut;
+    }
+
+    function swapPathHashAt(uint256 index) external view returns (bytes32) {
+        return swapPathHashes[index];
+    }
+
+    function swapPathHashCount() external view returns (uint256) {
+        return swapPathHashes.length;
     }
 
     function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts) {
@@ -57,6 +67,8 @@ contract MockRouter {
         lastAmountOutMin = amountOutMin;
         lastSwapTokenIn = path[0];
         lastSwapTokenOut = path[path.length - 1];
+        lastSwapTo = to;
+        swapPathHashes.push(keccak256(abi.encode(path)));
         require(IERC20Minimal(path[0]).transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
         address tokenOutAddr = path[path.length - 1];
         if (tokenOutAddr.code.length > 0) {
@@ -74,7 +86,7 @@ contract MockRouter {
         uint256 amountBDesired,
         uint256,
         uint256,
-        address,
+        address to,
         uint256
     ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
         if (failAddLiquidity) {
@@ -82,6 +94,7 @@ contract MockRouter {
         }
         lastAddLiquidityTokenA = tokenA;
         lastAddLiquidityTokenB = tokenB;
+        lastAddLiquidityTo = to;
         IERC20Minimal(tokenA).transferFrom(msg.sender, address(this), amountADesired);
         IERC20Minimal(tokenB).transferFrom(msg.sender, address(this), amountBDesired);
         return (amountADesired, amountBDesired, 1);

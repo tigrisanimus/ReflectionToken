@@ -59,30 +59,20 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint16 public buybackFeeBps = 40;
     uint16 public constant MAX_TOTAL_FEE_BPS = 100;
 
+    address public immutable ANKRBNB;
+
     mapping(address => bool) public ammPairs;
     mapping(address => bool) public routerAllowed;
     mapping(address => bool) public factoryAllowed;
     mapping(address => address) public pairRouter;
 
-    mapping(address => bool) public backingTokenAllowed;
-    address public buybackAnkrBnb;
-    address public buybackRouter;
+    mapping(address => bool) public hopTokenAllowed;
+    mapping(bytes32 => address[]) private _path;
 
-    struct PoolConfig {
-        address pair;
-        address router;
-        address backingToken;
-        uint16 weightBps;
-        bool enabled;
-    }
-
-    PoolConfig[] public pools;
-    uint256 public poolCursor;
-    uint256 public maxPoolsProcessedPerSwap = 2;
-
+    bool public swapEnabled = true;
     uint256 public swapThreshold;
     uint256 public maxSwapAmount;
-    uint16 public slippageBps = 50;
+    uint16 public slippageBps = 100;
 
     uint256 public tokensForLiquidity;
     uint256 public tokensForBuyback;
@@ -90,8 +80,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     bool private _inSwap;
 
     uint256 public buybackCooldownSeconds = 1 hours;
-    uint256 public maxBuybackAnkrBnb;
-    uint256 public buybackUpperLimitAnkrBnb;
+    uint256 public maxBuybackAnkr;
+    uint256 public buybackUpperLimitAnkr;
     uint256 public lastBuybackTimestamp;
 
     event FeesUpdated(uint16 reflectionFeeBps, uint16 liquidityFeeBps, uint16 buybackFeeBps);
@@ -103,13 +93,16 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         string memory symbol_,
         uint256 totalSupply_,
         uint256 swapThreshold_,
-        uint256 maxSwapAmount_
+        uint256 maxSwapAmount_,
+        address ankrBnb_
     ) {
         require(totalSupply_ > 0, "Supply zero");
+        require(ankrBnb_ != address(0), "ankrBNB zero");
         name = name_;
         symbol = symbol_;
         _tTotal = totalSupply_;
         _rTotal = MAX - (MAX % totalSupply_);
+        ANKRBNB = ankrBnb_;
 
         _rOwned[msg.sender] = _rTotal;
         emit Transfer(address(0), msg.sender, totalSupply_);
@@ -159,6 +152,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return _getRate();
     }
 
+    function getPath(address router, address tokenIn, address tokenOut) external view returns (address[] memory) {
+        return _getPath(router, tokenIn, tokenOut);
+    }
+
     function setFees(uint16 reflectionFee, uint16 liquidityFee, uint16 buybackFee) external onlyOwner {
         _enforceFeeCap(reflectionFee, liquidityFee, buybackFee);
         reflectionFeeBps = reflectionFee;
@@ -184,46 +181,38 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         require(routerAllowed[router], "Router not allowed");
 
         ammPairs[pair] = allowed;
-        pairRouter[pair] = router;
-    }
-
-    function setBackingTokenAllowed(address token, bool allowed) external onlyOwner {
-        backingTokenAllowed[token] = allowed;
-    }
-
-    function setBuybackAnkrBnb(address ankrBnb) external onlyOwner {
-        require(buybackAnkrBnb == address(0), "Buyback token set");
-        require(backingTokenAllowed[ankrBnb], "Token not allowed");
-        buybackAnkrBnb = ankrBnb;
-    }
-
-    function setBuybackRouter(address router) external onlyOwner {
-        require(routerAllowed[router], "Router not allowed");
-        buybackRouter = router;
-    }
-
-    function configurePools(PoolConfig[] calldata configs) external onlyOwner {
-        delete pools;
-        uint256 totalWeight;
-        for (uint256 i = 0; i < configs.length; i++) {
-            require(routerAllowed[configs[i].router], "Router not allowed");
-            require(backingTokenAllowed[configs[i].backingToken], "Backing token not allowed");
-            if (configs[i].enabled) {
-                totalWeight += configs[i].weightBps;
-            }
-            pools.push(configs[i]);
+        if (allowed) {
+            pairRouter[pair] = router;
+        } else {
+            pairRouter[pair] = address(0);
         }
-        require(totalWeight == BPS_DENOM, "Weights must sum 100%");
-        poolCursor = 0;
     }
 
-    function setSwapSettings(uint256 threshold, uint256 maxSwap) external onlyOwner {
+    function setHopTokenAllowed(address token, bool allowed) external onlyOwner {
+        hopTokenAllowed[token] = allowed;
+    }
+
+    function setPath(address router, address tokenIn, address tokenOut, address[] calldata path) external onlyOwner {
+        require(routerAllowed[router], "Router not allowed");
+        require(path.length >= 2 && path.length <= 4, "Bad path length");
+        require(path[0] == tokenIn, "Bad path start");
+        require(path[path.length - 1] == tokenOut, "Bad path end");
+        for (uint256 i = 0; i < path.length; i++) {
+            if (path[i] != address(this)) {
+                require(hopTokenAllowed[path[i]], "Hop token not allowed");
+            }
+        }
+        bytes32 key = _pathKey(router, tokenIn, tokenOut);
+        delete _path[key];
+        for (uint256 i = 0; i < path.length; i++) {
+            _path[key].push(path[i]);
+        }
+    }
+
+    function setSwapSettings(uint256 threshold, uint256 maxSwap, bool enabled) external onlyOwner {
         swapThreshold = threshold;
         maxSwapAmount = maxSwap;
-    }
-
-    function setMaxPoolsProcessed(uint256 maxPools) external onlyOwner {
-        maxPoolsProcessedPerSwap = maxPools;
+        swapEnabled = enabled;
     }
 
     function setSlippageBps(uint16 newSlippage) external onlyOwner {
@@ -233,16 +222,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit) external onlyOwner {
         buybackCooldownSeconds = cooldownSeconds;
-        maxBuybackAnkrBnb = maxPerCall;
-        buybackUpperLimitAnkrBnb = upperLimit;
-    }
-
-    function poolCount() external view returns (uint256) {
-        return pools.length;
-    }
-
-    function triggerBuyback() external {
-        _executeBuyback();
+        maxBuybackAnkr = maxPerCall;
+        buybackUpperLimitAnkr = upperLimit;
     }
 
     function _approve(address owner_, address spender, uint256 amount) internal {
@@ -263,10 +244,11 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             _tokenTransferNoFee(from, to, amount);
         }
 
-        if (!_inSwap && ammPairs[to]) {
+        bool isSell = ammPairs[to];
+        if (isSell && swapEnabled && !_inSwap) {
             uint256 contractTokenBalance = balanceOf(address(this));
             if (contractTokenBalance >= swapThreshold) {
-                _swapBack(contractTokenBalance);
+                _swapBack(pairRouter[to]);
             }
         }
     }
@@ -312,16 +294,23 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return _rTotal / _tTotal;
     }
 
-    function _swapBack(uint256 contractTokenBalance) internal {
+    function _swapBack(address router) internal {
         if (_inSwap) {
+            return;
+        }
+        if (router == address(0) || !routerAllowed[router]) {
             return;
         }
         uint256 totalTokensToSwap = tokensForLiquidity + tokensForBuyback;
         if (totalTokensToSwap == 0) {
             return;
         }
+        uint256 contractTokenBalance = balanceOf(address(this));
+        if (contractTokenBalance < swapThreshold) {
+            return;
+        }
         uint256 swapAmount = contractTokenBalance;
-        if (swapAmount > maxSwapAmount) {
+        if (maxSwapAmount > 0 && swapAmount > maxSwapAmount) {
             swapAmount = maxSwapAmount;
         }
         if (swapAmount > totalTokensToSwap) {
@@ -332,80 +321,70 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
 
         _inSwap = true;
-        uint256 liquidityPortion = (swapAmount * tokensForLiquidity) / totalTokensToSwap;
-        uint256 buybackPortion = swapAmount - liquidityPortion;
+        uint256 remaining = swapAmount;
+        uint256 usedLiquidity;
+        uint256 usedBuyback;
 
-        uint256 liquidityUsed = _processLiquidity(liquidityPortion);
-        uint256 buybackUsed = _processBuybackSwap(buybackPortion);
+        if (tokensForLiquidity > 0 && remaining > 0) {
+            uint256 liquidityTarget = tokensForLiquidity;
+            if (liquidityTarget > remaining) {
+                liquidityTarget = remaining;
+            }
+            usedLiquidity = _processLiquidity(router, liquidityTarget);
+            if (usedLiquidity > remaining) {
+                usedLiquidity = remaining;
+            }
+            remaining -= usedLiquidity;
+        }
 
-        tokensForLiquidity -= liquidityUsed;
-        tokensForBuyback -= buybackUsed;
+        if (tokensForBuyback > 0 && remaining > 0) {
+            uint256 buybackTarget = tokensForBuyback;
+            if (buybackTarget > remaining) {
+                buybackTarget = remaining;
+            }
+            usedBuyback = _processBuybackSwap(router, buybackTarget);
+        }
+
+        if (usedLiquidity > 0) {
+            tokensForLiquidity -= usedLiquidity;
+        }
+        if (usedBuyback > 0) {
+            tokensForBuyback -= usedBuyback;
+        }
         _inSwap = false;
 
         emit SwapBack(swapAmount);
     }
 
-    function _processLiquidity(uint256 amount) internal returns (uint256 used) {
+    function _processLiquidity(address router, uint256 amount) internal returns (uint256 used) {
         if (amount == 0) {
             return 0;
         }
-        uint256 enabledPools;
-        for (uint256 i = 0; i < pools.length; i++) {
-            if (pools[i].enabled) {
-                enabledPools++;
-            }
-        }
-        if (enabledPools == 0) {
-            return 0;
-        }
-
-        uint256 processed;
-        uint256 iterations;
-        uint256 cursor = poolCursor;
-        while (processed < maxPoolsProcessedPerSwap && iterations < pools.length) {
-            PoolConfig memory pool = pools[cursor];
-            cursor = (cursor + 1) % pools.length;
-            iterations++;
-            if (!pool.enabled) {
-                continue;
-            }
-            uint256 poolShare = (amount * pool.weightBps) / BPS_DENOM;
-            if (poolShare == 0) {
-                processed++;
-                continue;
-            }
-            bool success = _swapAndAddLiquidity(pool, poolShare);
-            if (success) {
-                used += poolShare;
-            }
-            processed++;
-        }
-        poolCursor = cursor;
-    }
-
-    function _swapAndAddLiquidity(PoolConfig memory pool, uint256 tokenAmount) internal returns (bool) {
-        uint256 half = tokenAmount / 2;
-        uint256 otherHalf = tokenAmount - half;
+        uint256 half = amount / 2;
+        uint256 otherHalf = amount - half;
         if (half == 0 || otherHalf == 0) {
-            return false;
+            return 0;
         }
-        if (!_swapTokensForBacking(pool.router, pool.backingToken, half)) {
-            return false;
+        uint256 beforeBalance = IERC20(ANKRBNB).balanceOf(address(this));
+        if (!_swapTokensForAnkr(router, otherHalf)) {
+            return 0;
         }
-        uint256 backingBalance = IERC20(pool.backingToken).balanceOf(address(this));
-        if (backingBalance == 0) {
-            return false;
+        uint256 afterBalance = IERC20(ANKRBNB).balanceOf(address(this));
+        uint256 ankrOut = afterBalance - beforeBalance;
+        if (ankrOut == 0) {
+            return 0;
         }
-        return _addLiquidity(pool.router, pool.backingToken, otherHalf, backingBalance);
+        if (!_addLiquidity(router, half, ankrOut)) {
+            return 0;
+        }
+        return amount;
     }
 
-    function _swapTokensForBacking(address router, address backingToken, uint256 amount) internal returns (bool) {
+    function _swapTokensForAnkr(address router, uint256 amount) internal returns (bool) {
         if (amount == 0) {
             return false;
         }
-        address[] memory path = new address[](2);
-        path[0] = address(this);
-        path[1] = backingToken;
+        address[] memory path = _getPath(router, address(this), ANKRBNB);
         uint256 amountOutMin = _quoteAmountOutMin(router, amount, path);
         if (amountOutMin == 0) {
             return false;
@@ -421,22 +400,14 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function _addLiquidity(address router, address backingToken, uint256 tokenAmount, uint256 backingAmount)
-        internal
-        returns (bool)
-    {
+    function _addLiquidity(address router, uint256 tokenAmount, uint256 ankrAmount) internal returns (bool) {
         _approve(address(this), router, tokenAmount);
-        IERC20(backingToken).approve(router, backingAmount);
+        IERC20(ANKRBNB).approve(router, ankrAmount);
+        uint256 minToken = (tokenAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM;
+        uint256 minAnkr = (ankrAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM;
         try IUniswapV2Router02(router)
             .addLiquidity(
-                address(this),
-                backingToken,
-                tokenAmount,
-                backingAmount,
-                (tokenAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM,
-                (backingAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM,
-                owner,
-                block.timestamp
+                address(this), ANKRBNB, tokenAmount, ankrAmount, minToken, minAnkr, DEAD, block.timestamp
             ) returns (
             uint256, uint256, uint256
         ) {
@@ -446,51 +417,49 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function _processBuybackSwap(uint256 tokenAmount) internal returns (uint256 used) {
-        if (tokenAmount == 0 || buybackAnkrBnb == address(0) || buybackRouter == address(0)) {
+    function _processBuybackSwap(address router, uint256 tokenAmount) internal returns (uint256 used) {
+        if (tokenAmount == 0) {
             return 0;
         }
-        if (!_swapTokensForBacking(buybackRouter, buybackAnkrBnb, tokenAmount)) {
+        if (!_swapTokensForAnkr(router, tokenAmount)) {
             return 0;
         }
         used = tokenAmount;
-        _executeBuyback();
+        _executeBuyback(router);
     }
 
-    function _executeBuyback() internal {
-        if (buybackAnkrBnb == address(0) || buybackRouter == address(0)) {
+    function _executeBuyback(address router) internal {
+        if (router == address(0) || !routerAllowed[router]) {
             return;
         }
         if (block.timestamp < lastBuybackTimestamp + buybackCooldownSeconds) {
             return;
         }
-        uint256 ankrBnbBalance = IERC20(buybackAnkrBnb).balanceOf(address(this));
-        if (ankrBnbBalance == 0) {
+        uint256 ankrBalance = IERC20(ANKRBNB).balanceOf(address(this));
+        if (ankrBalance == 0) {
             return;
         }
-        if (buybackUpperLimitAnkrBnb > 0 && ankrBnbBalance > buybackUpperLimitAnkrBnb) {
-            ankrBnbBalance = buybackUpperLimitAnkrBnb;
+        if (buybackUpperLimitAnkr > 0 && ankrBalance > buybackUpperLimitAnkr) {
+            ankrBalance = buybackUpperLimitAnkr;
         }
-        if (maxBuybackAnkrBnb > 0 && ankrBnbBalance > maxBuybackAnkrBnb) {
-            ankrBnbBalance = maxBuybackAnkrBnb;
+        if (maxBuybackAnkr > 0 && ankrBalance > maxBuybackAnkr) {
+            ankrBalance = maxBuybackAnkr;
         }
-        if (ankrBnbBalance == 0) {
+        if (ankrBalance == 0) {
             return;
         }
-        address[] memory path = new address[](2);
-        path[0] = buybackAnkrBnb;
-        path[1] = address(this);
-        uint256 amountOutMin = _quoteAmountOutMin(buybackRouter, ankrBnbBalance, path);
+        address[] memory path = _getPath(router, ANKRBNB, address(this));
+        uint256 amountOutMin = _quoteAmountOutMin(router, ankrBalance, path);
         if (amountOutMin == 0) {
             return;
         }
-        IERC20(buybackAnkrBnb).approve(buybackRouter, ankrBnbBalance);
-        try IUniswapV2Router02(buybackRouter)
+        IERC20(ANKRBNB).approve(router, ankrBalance);
+        try IUniswapV2Router02(router)
             .swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                ankrBnbBalance, amountOutMin, path, DEAD, block.timestamp
+                ankrBalance, amountOutMin, path, DEAD, block.timestamp
             ) {
             lastBuybackTimestamp = block.timestamp;
-            emit Buyback(buybackRouter, ankrBnbBalance);
+            emit Buyback(router, ankrBalance);
         } catch {
             return;
         }
@@ -517,6 +486,26 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             minOut = 1;
         }
         return minOut;
+    }
+
+    function _pathKey(address router, address tokenIn, address tokenOut) internal pure returns (bytes32) {
+        return keccak256(abi.encode(router, tokenIn, tokenOut));
+    }
+
+    function _getPath(address router, address tokenIn, address tokenOut) internal view returns (address[] memory) {
+        bytes32 key = _pathKey(router, tokenIn, tokenOut);
+        address[] storage stored = _path[key];
+        if (stored.length > 0) {
+            address[] memory path = new address[](stored.length);
+            for (uint256 i = 0; i < stored.length; i++) {
+                path[i] = stored[i];
+            }
+            return path;
+        }
+        address[] memory direct = new address[](2);
+        direct[0] = tokenIn;
+        direct[1] = tokenOut;
+        return direct;
     }
 
     function _enforceFeeCap(uint16 reflectionFee, uint16 liquidityFee, uint16 buybackFee) internal pure {
