@@ -12,8 +12,7 @@ contract ReflectionTokenV2Test is Test {
     ReflectionTokenV2 private token;
     MockFactory private factory;
     MockRouter private router;
-    MockERC20 private wbnb;
-    MockERC20 private wbtc;
+    MockERC20 private ankrBnb;
     MockERC20 private stable;
     MockPair private pair;
 
@@ -23,8 +22,7 @@ contract ReflectionTokenV2Test is Test {
     function setUp() public {
         factory = new MockFactory();
         router = new MockRouter(address(factory));
-        wbnb = new MockERC20("WBNB", "WBNB", 18);
-        wbtc = new MockERC20("WBTC", "WBTC", 8);
+        ankrBnb = new MockERC20("ankrBNB", "ankrBNB", 18);
         stable = new MockERC20("USDC", "USDC", 6);
 
         token = new ReflectionTokenV2("Reflection V2", "RV2", 1_000_000e18, 500e18, 5_000e18);
@@ -32,12 +30,11 @@ contract ReflectionTokenV2Test is Test {
         token.setFactoryAllowed(address(factory), true);
         token.setRouterAllowed(address(router), true);
 
-        token.setBackingTokenAllowed(address(wbnb), true);
-        token.setBackingTokenAllowed(address(wbtc), true);
+        token.setBackingTokenAllowed(address(ankrBnb), true);
         token.setBackingTokenAllowed(address(stable), true);
 
-        pair = new MockPair(address(token), address(wbnb), address(factory));
-        factory.setPair(address(token), address(wbnb), address(pair));
+        pair = new MockPair(address(token), address(ankrBnb), address(factory));
+        factory.setPair(address(token), address(ankrBnb), address(pair));
 
         token.transfer(address(pair), 200_000e18);
         token.setAmmPair(address(pair), address(router), true);
@@ -81,7 +78,7 @@ contract ReflectionTokenV2Test is Test {
     }
 
     function testNonRegisteredPairNoFees() public {
-        MockPair otherPair = new MockPair(address(token), address(wbtc), address(factory));
+        MockPair otherPair = new MockPair(address(token), address(stable), address(factory));
         uint256 amount = 1_000e18;
         token.transfer(address(otherPair), amount);
 
@@ -107,7 +104,7 @@ contract ReflectionTokenV2Test is Test {
         configs[0] = ReflectionTokenV2.PoolConfig({
             pair: address(pair),
             router: address(failingRouter),
-            backingToken: address(wbnb),
+            backingToken: address(ankrBnb),
             weightBps: 10_000,
             enabled: true
         });
@@ -131,7 +128,11 @@ contract ReflectionTokenV2Test is Test {
 
         ReflectionTokenV2.PoolConfig[] memory configs = new ReflectionTokenV2.PoolConfig[](2);
         configs[0] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair), router: address(router), backingToken: address(wbnb), weightBps: 5_000, enabled: true
+            pair: address(pair),
+            router: address(router),
+            backingToken: address(ankrBnb),
+            weightBps: 5_000,
+            enabled: true
         });
         configs[1] = ReflectionTokenV2.PoolConfig({
             pair: address(pair),
@@ -157,31 +158,35 @@ contract ReflectionTokenV2Test is Test {
         assertEq(token.poolCursor(), 1);
     }
 
-    function testBuybackUsesWbtcBudgetAndCooldown() public {
-        token.setBuybackWbtc(address(wbtc));
+    function testBuybackUsesAnkrBnbBudgetAndCooldown() public {
+        token.setBuybackAnkrBnb(address(ankrBnb));
         token.setBuybackRouter(address(router));
-        token.setBuybackSettings(100, 50e8, 0);
+        token.setBuybackSettings(100, 50e18, 0);
         router.setQuotedAmountOut(1000);
 
-        wbtc.mint(address(token), 200e8);
+        ankrBnb.mint(address(token), 200e18);
         token.transfer(address(router), 100_000e18);
 
         vm.warp(1000);
         token.triggerBuyback();
 
-        assertEq(wbtc.balanceOf(address(token)), 150e8);
-        assertEq(router.lastSwapTokenIn(), address(wbtc));
+        assertEq(ankrBnb.balanceOf(address(token)), 150e18);
+        assertEq(router.lastSwapTokenIn(), address(ankrBnb));
 
         token.triggerBuyback();
 
-        assertEq(wbtc.balanceOf(address(token)), 150e8);
+        assertEq(ankrBnb.balanceOf(address(token)), 150e18);
     }
 
     function testSlippageBpsAppliedToAmountOutMin() public {
         token.setFees(0, 100, 0);
         ReflectionTokenV2.PoolConfig[] memory configs = new ReflectionTokenV2.PoolConfig[](1);
         configs[0] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair), router: address(router), backingToken: address(wbnb), weightBps: 10_000, enabled: true
+            pair: address(pair),
+            router: address(router),
+            backingToken: address(ankrBnb),
+            weightBps: 10_000,
+            enabled: true
         });
         token.configurePools(configs);
         token.setSlippageBps(100);
@@ -198,12 +203,12 @@ contract ReflectionTokenV2Test is Test {
 
     function testSetAmmPairValidatesFactoryAndTokens() public {
         MockFactory otherFactory = new MockFactory();
-        MockPair badPair = new MockPair(address(wbnb), address(wbtc), address(otherFactory));
+        MockPair badPair = new MockPair(address(ankrBnb), address(stable), address(otherFactory));
 
         vm.expectRevert("Pair missing token");
         token.setAmmPair(address(badPair), address(router), true);
 
-        MockPair wrongFactoryPair = new MockPair(address(token), address(wbnb), address(otherFactory));
+        MockPair wrongFactoryPair = new MockPair(address(token), address(ankrBnb), address(otherFactory));
         vm.expectRevert("Pair factory not allowed");
         token.setAmmPair(address(wrongFactoryPair), address(router), true);
     }
