@@ -54,9 +54,9 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(address => uint256) private _rOwned;
     mapping(address => mapping(address => uint256)) private _allowances;
 
-    uint16 public reflectionFeeBps = 20;
-    uint16 public liquidityFeeBps = 40;
-    uint16 public buybackFeeBps = 40;
+    uint16 public constant reflectionFeeBps = 20;
+    uint16 public constant liquidityFeeBps = 40;
+    uint16 public constant buybackFeeBps = 40;
     uint16 public constant MAX_TOTAL_FEE_BPS = 100;
 
     address public immutable ANKRBNB;
@@ -69,7 +69,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(address => bool) public hopTokenAllowed;
     mapping(bytes32 => address[]) private _path;
 
-    bool public swapEnabled = true;
+    bool public swapEnabled;
     uint256 public swapThreshold;
     uint256 public maxSwapAmount;
     uint16 public slippageBps = 100;
@@ -79,37 +79,47 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     bool private _inSwap;
 
-    uint256 public buybackCooldownSeconds = 1 hours;
+    uint256 public buybackCooldownSeconds;
     uint256 public maxBuybackAnkr;
     uint256 public buybackUpperLimitAnkr;
     uint256 public lastBuybackTimestamp;
+    bool public configFinalized;
 
-    event FeesUpdated(uint16 reflectionFeeBps, uint16 liquidityFeeBps, uint16 buybackFeeBps);
+    uint256 public constant TOTAL_SUPPLY = 1_000_000e18;
+    uint256 public constant DEFAULT_SWAP_THRESHOLD = 100e18;
+    uint256 public constant DEFAULT_MAX_SWAP_AMOUNT = 500e18;
+    uint256 public constant DEFAULT_MAX_BUYBACK_ANKR = 1e18;
+    uint256 public constant DEFAULT_BUYBACK_UPPER_LIMIT_ANKR = 2e18;
+    uint256 public constant DEFAULT_BUYBACK_COOLDOWN = 120;
+    uint256 public constant MAX_SWAP_THRESHOLD_BPS = 50;
+    uint256 public constant MAX_SWAP_AMOUNT_BPS = 100;
+    uint256 public constant MAX_BUYBACK_COOLDOWN = 1 days;
+    uint256 public constant MAX_BUYBACK_ANKR = 100e18;
+
     event SwapBack(uint256 tokensSwapped);
     event Buyback(address indexed router, uint256 amountIn);
+    event ConfigFinalized();
 
-    constructor(
-        string memory name_,
-        string memory symbol_,
-        uint256 totalSupply_,
-        uint256 swapThreshold_,
-        uint256 maxSwapAmount_,
-        address ankrBnb_
-    ) {
-        require(totalSupply_ > 0, "Supply zero");
+    constructor(address ankrBnb_) {
         require(ankrBnb_ != address(0), "ankrBNB zero");
-        name = name_;
-        symbol = symbol_;
-        _tTotal = totalSupply_;
-        _rTotal = MAX - (MAX % totalSupply_);
+        name = "Basalt";
+        symbol = "BASLT";
+        _tTotal = TOTAL_SUPPLY;
+        _rTotal = MAX - (MAX % _tTotal);
         ANKRBNB = ankrBnb_;
 
         _rOwned[msg.sender] = _rTotal;
-        emit Transfer(address(0), msg.sender, totalSupply_);
+        emit Transfer(address(0), msg.sender, _tTotal);
 
-        swapThreshold = swapThreshold_;
-        maxSwapAmount = maxSwapAmount_;
-        _enforceFeeCap(reflectionFeeBps, liquidityFeeBps, buybackFeeBps);
+        swapEnabled = false;
+        swapThreshold = DEFAULT_SWAP_THRESHOLD;
+        maxSwapAmount = DEFAULT_MAX_SWAP_AMOUNT;
+        buybackCooldownSeconds = DEFAULT_BUYBACK_COOLDOWN;
+        maxBuybackAnkr = DEFAULT_MAX_BUYBACK_ANKR;
+        buybackUpperLimitAnkr = DEFAULT_BUYBACK_UPPER_LIMIT_ANKR;
+        _enforceFeeCap();
+        _enforceSwapLimits(swapThreshold, maxSwapAmount);
+        _enforceBuybackLimits(buybackCooldownSeconds, maxBuybackAnkr, buybackUpperLimitAnkr);
     }
 
     function totalSupply() external view override returns (uint256) {
@@ -156,24 +166,24 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return _getPath(router, tokenIn, tokenOut);
     }
 
-    function setFees(uint16 reflectionFee, uint16 liquidityFee, uint16 buybackFee) external onlyOwner {
-        _enforceFeeCap(reflectionFee, liquidityFee, buybackFee);
-        reflectionFeeBps = reflectionFee;
-        liquidityFeeBps = liquidityFee;
-        buybackFeeBps = buybackFee;
-        emit FeesUpdated(reflectionFee, liquidityFee, buybackFee);
+    function finalizeConfig() external onlyOwner {
+        configFinalized = true;
+        emit ConfigFinalized();
     }
 
     function setFactoryAllowed(address factory, bool allowed) external onlyOwner {
+        _requireConfigurable();
         factoryAllowed[factory] = allowed;
     }
 
     function setRouterAllowed(address router, bool allowed) external onlyOwner {
+        _requireConfigurable();
         require(factoryAllowed[IUniswapV2Router02(router).factory()], "Factory not allowed");
         routerAllowed[router] = allowed;
     }
 
     function setAmmPair(address pair, address router, bool allowed) external onlyOwner {
+        _requireConfigurable();
         address token0 = IUniswapV2Pair(pair).token0();
         address token1 = IUniswapV2Pair(pair).token1();
         require(token0 == address(this) || token1 == address(this), "Pair missing token");
@@ -189,18 +199,22 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function setHopTokenAllowed(address token, bool allowed) external onlyOwner {
+        _requireConfigurable();
         hopTokenAllowed[token] = allowed;
     }
 
     function setPath(address router, address tokenIn, address tokenOut, address[] calldata path) external onlyOwner {
+        _requireConfigurable();
         require(routerAllowed[router], "Router not allowed");
         require(path.length >= 2 && path.length <= 4, "Bad path length");
         require(path[0] == tokenIn, "Bad path start");
         require(path[path.length - 1] == tokenOut, "Bad path end");
         for (uint256 i = 0; i < path.length; i++) {
-            if (path[i] != address(this)) {
-                require(hopTokenAllowed[path[i]], "Hop token not allowed");
+            address hop = path[i];
+            if (hop == address(this) || hop == tokenIn || hop == tokenOut) {
+                continue;
             }
+            require(hopTokenAllowed[hop], "Hop token not allowed");
         }
         bytes32 key = _pathKey(router, tokenIn, tokenOut);
         delete _path[key];
@@ -209,21 +223,30 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function setSwapSettings(uint256 threshold, uint256 maxSwap, bool enabled) external onlyOwner {
+    function setSwapSettings(uint256 threshold, uint256 maxSwap) external onlyOwner {
+        _requireConfigurable();
+        _enforceSwapLimits(threshold, maxSwap);
         swapThreshold = threshold;
         maxSwapAmount = maxSwap;
-        swapEnabled = enabled;
     }
 
     function setSlippageBps(uint16 newSlippage) external onlyOwner {
+        _requireConfigurable();
         require(newSlippage <= 1_000, "Slippage too high");
         slippageBps = newSlippage;
     }
 
     function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit) external onlyOwner {
+        _requireConfigurable();
+        _enforceBuybackLimits(cooldownSeconds, maxPerCall, upperLimit);
         buybackCooldownSeconds = cooldownSeconds;
         maxBuybackAnkr = maxPerCall;
         buybackUpperLimitAnkr = upperLimit;
+    }
+
+    function setSwapEnabled(bool enabled) external onlyOwner {
+        _requireConfigurable();
+        swapEnabled = enabled;
     }
 
     function _approve(address owner_, address spender, uint256 amount) internal {
@@ -345,6 +368,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             usedBuyback = _processBuybackSwap(router, buybackTarget);
         }
 
+        _executeBuyback(router);
         if (usedLiquidity > 0) {
             tokensForLiquidity -= usedLiquidity;
         }
@@ -425,7 +449,6 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             return 0;
         }
         used = tokenAmount;
-        _executeBuyback(router);
     }
 
     function _executeBuyback(address router) internal {
@@ -508,8 +531,41 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return direct;
     }
 
-    function _enforceFeeCap(uint16 reflectionFee, uint16 liquidityFee, uint16 buybackFee) internal pure {
-        uint256 total = uint256(reflectionFee) + uint256(liquidityFee) + uint256(buybackFee);
+    function _requireConfigurable() internal view {
+        require(!configFinalized, "Config finalized");
+    }
+
+    function _enforceFeeCap() internal pure {
+        uint256 total = uint256(reflectionFeeBps) + uint256(liquidityFeeBps) + uint256(buybackFeeBps);
         require(total <= MAX_TOTAL_FEE_BPS, "Fee cap");
+    }
+
+    function _enforceSwapLimits(uint256 threshold, uint256 maxSwap) internal view {
+        require(threshold > 0, "Swap threshold zero");
+        require(maxSwap > 0, "Max swap zero");
+        require(threshold <= _maxSwapThreshold(), "Swap threshold too high");
+        require(maxSwap <= _maxSwapAmount(), "Max swap too high");
+        require(maxSwap >= threshold, "Max swap < threshold");
+    }
+
+    function _enforceBuybackLimits(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit) internal pure {
+        require(cooldownSeconds <= MAX_BUYBACK_COOLDOWN, "Cooldown too high");
+        if (maxPerCall > 0) {
+            require(maxPerCall <= MAX_BUYBACK_ANKR, "Max buyback too high");
+        }
+        if (upperLimit > 0) {
+            require(upperLimit <= MAX_BUYBACK_ANKR, "Upper limit too high");
+            if (maxPerCall > 0) {
+                require(upperLimit >= maxPerCall, "Upper limit < max");
+            }
+        }
+    }
+
+    function _maxSwapThreshold() internal view returns (uint256) {
+        return (_tTotal * MAX_SWAP_THRESHOLD_BPS) / BPS_DENOM;
+    }
+
+    function _maxSwapAmount() internal view returns (uint256) {
+        return (_tTotal * MAX_SWAP_AMOUNT_BPS) / BPS_DENOM;
     }
 }
