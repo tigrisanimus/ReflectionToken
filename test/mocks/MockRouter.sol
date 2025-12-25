@@ -12,6 +12,7 @@ contract MockRouter {
 
     bool public failSwap;
     bool public failAddLiquidity;
+    bool public failGetAmountsOut;
     uint256 public quotedAmountOut;
     uint256 public lastAmountOutMin;
     address public lastSwapTokenIn;
@@ -36,6 +37,10 @@ contract MockRouter {
         failAddLiquidity = value;
     }
 
+    function setFailGetAmountsOut(bool value) external {
+        failGetAmountsOut = value;
+    }
+
     function setQuotedAmountOut(uint256 amountOut) external {
         quotedAmountOut = amountOut;
     }
@@ -49,6 +54,9 @@ contract MockRouter {
     }
 
     function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts) {
+        if (failGetAmountsOut) {
+            revert("Quote failed");
+        }
         amounts = new uint256[](path.length);
         amounts[0] = amountIn;
         amounts[path.length - 1] = quotedAmountOut;
