@@ -301,6 +301,42 @@ contract ReflectionTokenV2Test is Test {
         token.setHopTokenAllowed(address(wbnb), false);
     }
 
+    function testFinalizeConfigAllowsSwapDisableOnly() public {
+        token.setSwapEnabled(true);
+        token.finalizeConfig();
+
+        token.setSwapEnabled(false);
+        assertFalse(token.swapEnabled());
+
+        vm.expectRevert("Config finalized");
+        token.setSwapEnabled(true);
+    }
+
+    function testRenounceOwnershipLocksAdmin() public {
+        token.renounceOwnership();
+
+        vm.expectRevert("Not owner");
+        token.setSwapEnabled(false);
+
+        vm.expectRevert("Not owner");
+        token.finalizeConfig();
+
+        uint256 amount = 1_000e18;
+        token.transfer(alice, amount);
+        assertEq(token.balanceOf(alice), amount);
+    }
+
+    function testSlippageBounded() public {
+        vm.expectRevert("Slippage too high");
+        token.setSlippageBps(501);
+    }
+
+    function testRateGuardrails() public {
+        bytes32 rTotalSlot = bytes32(uint256(3));
+        vm.store(address(token), rTotalSlot, bytes32(uint256(0)));
+        assertEq(token.getRate(), 1);
+    }
+
     function _buildPath(address a, address b, address c) private pure returns (address[] memory path) {
         path = new address[](3);
         path[0] = a;

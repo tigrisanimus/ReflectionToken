@@ -34,6 +34,11 @@ abstract contract Ownable {
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
     }
+
+    function renounceOwnership() external onlyOwner {
+        emit OwnershipTransferred(owner, address(0));
+        owner = address(0);
+    }
 }
 
 contract ReflectionTokenV2 is IERC20, Ownable {
@@ -122,6 +127,11 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         _enforceBuybackLimits(buybackCooldownSeconds, maxBuybackAnkr, buybackUpperLimitAnkr);
     }
 
+    modifier onlyConfigurable() {
+        require(!configFinalized, "Config finalized");
+        _;
+    }
+
     function totalSupply() external view override returns (uint256) {
         return _tTotal;
     }
@@ -171,19 +181,16 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         emit ConfigFinalized();
     }
 
-    function setFactoryAllowed(address factory, bool allowed) external onlyOwner {
-        _requireConfigurable();
+    function setFactoryAllowed(address factory, bool allowed) external onlyOwner onlyConfigurable {
         factoryAllowed[factory] = allowed;
     }
 
-    function setRouterAllowed(address router, bool allowed) external onlyOwner {
-        _requireConfigurable();
+    function setRouterAllowed(address router, bool allowed) external onlyOwner onlyConfigurable {
         require(factoryAllowed[IUniswapV2Router02(router).factory()], "Factory not allowed");
         routerAllowed[router] = allowed;
     }
 
-    function setAmmPair(address pair, address router, bool allowed) external onlyOwner {
-        _requireConfigurable();
+    function setAmmPair(address pair, address router, bool allowed) external onlyOwner onlyConfigurable {
         address token0 = IUniswapV2Pair(pair).token0();
         address token1 = IUniswapV2Pair(pair).token1();
         require(token0 == address(this) || token1 == address(this), "Pair missing token");
@@ -198,13 +205,15 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function setHopTokenAllowed(address token, bool allowed) external onlyOwner {
-        _requireConfigurable();
+    function setHopTokenAllowed(address token, bool allowed) external onlyOwner onlyConfigurable {
         hopTokenAllowed[token] = allowed;
     }
 
-    function setPath(address router, address tokenIn, address tokenOut, address[] calldata path) external onlyOwner {
-        _requireConfigurable();
+    function setPath(address router, address tokenIn, address tokenOut, address[] calldata path)
+        external
+        onlyOwner
+        onlyConfigurable
+    {
         require(routerAllowed[router], "Router not allowed");
         require(path.length >= 2 && path.length <= 4, "Bad path length");
         require(path[0] == tokenIn, "Bad path start");
@@ -223,21 +232,22 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function setSwapSettings(uint256 threshold, uint256 maxSwap) external onlyOwner {
-        _requireConfigurable();
+    function setSwapSettings(uint256 threshold, uint256 maxSwap) external onlyOwner onlyConfigurable {
         _enforceSwapLimits(threshold, maxSwap);
         swapThreshold = threshold;
         maxSwapAmount = maxSwap;
     }
 
-    function setSlippageBps(uint16 newSlippage) external onlyOwner {
-        _requireConfigurable();
-        require(newSlippage <= 1_000, "Slippage too high");
+    function setSlippageBps(uint16 newSlippage) external onlyOwner onlyConfigurable {
+        require(newSlippage <= 500, "Slippage too high");
         slippageBps = newSlippage;
     }
 
-    function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit) external onlyOwner {
-        _requireConfigurable();
+    function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit)
+        external
+        onlyOwner
+        onlyConfigurable
+    {
         _enforceBuybackLimits(cooldownSeconds, maxPerCall, upperLimit);
         buybackCooldownSeconds = cooldownSeconds;
         maxBuybackAnkr = maxPerCall;
@@ -245,7 +255,9 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function setSwapEnabled(bool enabled) external onlyOwner {
-        _requireConfigurable();
+        if (configFinalized) {
+            require(!enabled, "Config finalized");
+        }
         swapEnabled = enabled;
     }
 
@@ -314,7 +326,11 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function _getRate() internal view returns (uint256) {
-        return _rTotal / _tTotal;
+        (uint256 rSupply, uint256 tSupply) = _getCurrentSupply();
+        if (rSupply == 0 || tSupply == 0) {
+            return 1;
+        }
+        return rSupply / tSupply;
     }
 
     function _swapBack(address router) internal {
@@ -531,8 +547,12 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return direct;
     }
 
-    function _requireConfigurable() internal view {
-        require(!configFinalized, "Config finalized");
+    function _getCurrentSupply() internal view returns (uint256 rSupply, uint256 tSupply) {
+        rSupply = _rTotal;
+        tSupply = _tTotal;
+        if (tSupply == 0 || rSupply < tSupply) {
+            return (_rTotal, _tTotal);
+        }
     }
 
     function _enforceFeeCap() internal pure {
