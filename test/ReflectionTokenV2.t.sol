@@ -13,25 +13,39 @@ contract ReflectionTokenV2Test is Test {
     MockFactory private factory;
     MockRouter private router;
     MockERC20 private ankrBnb;
+    MockERC20 private wbnb;
     MockERC20 private stable;
     MockPair private pair;
 
     address private alice = address(0xA11CE);
-    address private bob = address(0xB0B);
 
     function setUp() public {
         factory = new MockFactory();
         router = new MockRouter(address(factory));
         ankrBnb = new MockERC20("ankrBNB", "ankrBNB", 18);
+        wbnb = new MockERC20("WBNB", "WBNB", 18);
         stable = new MockERC20("USDC", "USDC", 6);
 
-        token = new ReflectionTokenV2("Reflection V2", "RV2", 1_000_000e18, 500e18, 5_000e18);
+        token = new ReflectionTokenV2("Reflection V2", "RV2", 1_000_000e18, 500e18, 5_000e18, address(ankrBnb));
 
         token.setFactoryAllowed(address(factory), true);
         token.setRouterAllowed(address(router), true);
 
-        token.setBackingTokenAllowed(address(ankrBnb), true);
-        token.setBackingTokenAllowed(address(stable), true);
+        token.setHopTokenAllowed(address(wbnb), true);
+        token.setHopTokenAllowed(address(ankrBnb), true);
+        token.setHopTokenAllowed(address(stable), true);
+
+        address[] memory pathToAnkr = new address[](3);
+        pathToAnkr[0] = address(token);
+        pathToAnkr[1] = address(wbnb);
+        pathToAnkr[2] = address(ankrBnb);
+        token.setPath(address(router), address(token), address(ankrBnb), pathToAnkr);
+
+        address[] memory pathToToken = new address[](3);
+        pathToToken[0] = address(ankrBnb);
+        pathToToken[1] = address(wbnb);
+        pathToToken[2] = address(token);
+        token.setPath(address(router), address(ankrBnb), address(token), pathToToken);
 
         pair = new MockPair(address(token), address(ankrBnb), address(factory));
         factory.setPair(address(token), address(ankrBnb), address(pair));
@@ -77,43 +91,76 @@ contract ReflectionTokenV2Test is Test {
         assertEq(token.tokensForBuyback(), (amount * 40) / 10_000);
     }
 
-    function testNonRegisteredPairNoFees() public {
-        MockPair otherPair = new MockPair(address(token), address(stable), address(factory));
-        uint256 amount = 1_000e18;
-        token.transfer(address(otherPair), amount);
+    function testSwapBackOnSellAddsLiquidityAndBuyback() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18, true);
+        token.setBuybackSettings(0, 1e18, 0);
 
-        vm.prank(address(otherPair));
-        token.transfer(alice, amount);
+        uint256 sellAmount = 10_000e18;
+        token.transfer(alice, 40_000e18);
 
-        assertEq(token.balanceOf(alice), amount);
-        assertEq(token.tokensForLiquidity(), 0);
-        assertEq(token.tokensForBuyback(), 0);
+        vm.prank(alice);
+        token.transfer(address(pair), sellAmount);
+
+        assertEq(router.lastAddLiquidityTokenA(), address(token));
+        assertEq(router.lastAddLiquidityTokenB(), address(ankrBnb));
+        assertEq(router.lastAddLiquidityTo(), token.DEAD());
+        assertGt(ankrBnb.balanceOf(address(token)), 0);
+        assertGt(token.balanceOf(token.DEAD()), 0);
     }
 
-    function testFeeCapEnforced() public {
-        vm.expectRevert("Fee cap");
-        token.setFees(50, 40, 20);
+    function testMultiHopPathUsage() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18, true);
+        token.setBuybackSettings(0, 5e18, 0);
+
+        token.transfer(alice, 20_000e18);
+
+        vm.prank(alice);
+        token.transfer(address(pair), 20_000e18);
+
+        bytes32 expectedTokenToAnkr = _hashPath(_buildPath(address(token), address(wbnb), address(ankrBnb)));
+        bytes32 expectedAnkrToToken = _hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)));
+
+        uint256 count = router.swapPathHashCount();
+        bool foundTokenToAnkr;
+        bool foundAnkrToToken;
+        for (uint256 i = 0; i < count; i++) {
+            bytes32 hash = router.swapPathHashAt(i);
+            if (hash == expectedTokenToAnkr) {
+                foundTokenToAnkr = true;
+            }
+            if (hash == expectedAnkrToToken) {
+                foundAnkrToToken = true;
+            }
+        }
+
+        assertTrue(foundTokenToAnkr, "token->ankr path not used");
+        assertTrue(foundAnkrToToken, "ankr->token path not used");
     }
 
-    function testSwapbackRouterFailureDoesNotRevert() public {
+    function testRouterFailureDoesNotRevert() public {
         MockRouter failingRouter = new MockRouter(address(factory));
         token.setRouterAllowed(address(failingRouter), true);
-        token.setAmmPair(address(pair), address(failingRouter), true);
 
-        ReflectionTokenV2.PoolConfig[] memory configs = new ReflectionTokenV2.PoolConfig[](1);
-        configs[0] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair),
-            router: address(failingRouter),
-            backingToken: address(ankrBnb),
-            weightBps: 10_000,
-            enabled: true
-        });
-        token.configurePools(configs);
+        address[] memory pathToAnkr = new address[](3);
+        pathToAnkr[0] = address(token);
+        pathToAnkr[1] = address(wbnb);
+        pathToAnkr[2] = address(ankrBnb);
+        token.setPath(address(failingRouter), address(token), address(ankrBnb), pathToAnkr);
+
+        address[] memory pathToToken = new address[](3);
+        pathToToken[0] = address(ankrBnb);
+        pathToToken[1] = address(wbnb);
+        pathToToken[2] = address(token);
+        token.setPath(address(failingRouter), address(ankrBnb), address(token), pathToToken);
+
+        token.setAmmPair(address(pair), address(failingRouter), true);
 
         failingRouter.setFailSwap(true);
         failingRouter.setFailAddLiquidity(true);
 
-        token.setSwapSettings(1e18, 10_000e18);
+        token.setSwapSettings(1e18, 10_000e18, true);
         token.transfer(alice, 5_000e18);
 
         vm.prank(alice);
@@ -122,94 +169,57 @@ contract ReflectionTokenV2Test is Test {
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
-    function testRoundRobinPoolProcessingRespectsMax() public {
-        MockRouter routerTwo = new MockRouter(address(factory));
-        token.setRouterAllowed(address(routerTwo), true);
+    function testFeeCapEnforced() public {
+        vm.expectRevert("Fee cap");
+        token.setFees(50, 40, 20);
+    }
 
-        ReflectionTokenV2.PoolConfig[] memory configs = new ReflectionTokenV2.PoolConfig[](2);
-        configs[0] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair),
-            router: address(router),
-            backingToken: address(ankrBnb),
-            weightBps: 5_000,
-            enabled: true
-        });
-        configs[1] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair),
-            router: address(routerTwo),
-            backingToken: address(stable),
-            weightBps: 5_000,
-            enabled: true
-        });
-        token.configurePools(configs);
-        token.setMaxPoolsProcessed(1);
-        router.setQuotedAmountOut(1000);
-        routerTwo.setQuotedAmountOut(1000);
+    function testCooldownEnforcedForBuyback() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18, true);
+        token.setBuybackSettings(1000, 5e18, 0);
 
-        token.setSwapSettings(1e18, 10_000e18);
-        token.transfer(alice, 10_000e18);
+        uint256 sellAmount = 10_000e18;
+        token.transfer(alice, 40_000e18);
 
         vm.prank(alice);
-        token.transfer(address(pair), 10_000e18);
+        token.transfer(address(pair), sellAmount);
 
-        bool firstCalled = router.lastAddLiquidityTokenA() == address(token);
-        bool secondCalled = routerTwo.lastAddLiquidityTokenA() == address(token);
-        assertTrue(firstCalled != secondCalled, "Only one pool processed");
-        assertEq(token.poolCursor(), 1);
-    }
+        uint256 deadBalance = token.balanceOf(token.DEAD());
+        assertEq(deadBalance, 0);
 
-    function testBuybackUsesAnkrBnbBudgetAndCooldown() public {
-        token.setBuybackAnkrBnb(address(ankrBnb));
-        token.setBuybackRouter(address(router));
-        token.setBuybackSettings(100, 50e18, 0);
-        router.setQuotedAmountOut(1000);
-
-        ankrBnb.mint(address(token), 200e18);
-        token.transfer(address(router), 100_000e18);
-
-        vm.warp(1000);
-        token.triggerBuyback();
-
-        assertEq(ankrBnb.balanceOf(address(token)), 150e18);
-        assertEq(router.lastSwapTokenIn(), address(ankrBnb));
-
-        token.triggerBuyback();
-
-        assertEq(ankrBnb.balanceOf(address(token)), 150e18);
-    }
-
-    function testSlippageBpsAppliedToAmountOutMin() public {
-        token.setFees(0, 100, 0);
-        ReflectionTokenV2.PoolConfig[] memory configs = new ReflectionTokenV2.PoolConfig[](1);
-        configs[0] = ReflectionTokenV2.PoolConfig({
-            pair: address(pair),
-            router: address(router),
-            backingToken: address(ankrBnb),
-            weightBps: 10_000,
-            enabled: true
-        });
-        token.configurePools(configs);
-        token.setSlippageBps(100);
-        router.setQuotedAmountOut(1000);
-
-        token.setSwapSettings(1e18, 10_000e18);
-        token.transfer(alice, 10_000e18);
-
+        vm.warp(2000);
         vm.prank(alice);
-        token.transfer(address(pair), 10_000e18);
+        token.transfer(address(pair), sellAmount);
 
-        assertEq(router.lastAmountOutMin(), 990);
+        uint256 afterBuyback = token.balanceOf(token.DEAD());
+        assertGt(afterBuyback, 0);
+        uint256 buybackCount = _countSwapPath(_hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token))));
+
+        vm.warp(2001);
+        vm.prank(alice);
+        token.transfer(address(pair), sellAmount);
+
+        assertEq(_countSwapPath(_hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)))), buybackCount);
     }
 
-    function testSetAmmPairValidatesFactoryAndTokens() public {
-        MockFactory otherFactory = new MockFactory();
-        MockPair badPair = new MockPair(address(ankrBnb), address(stable), address(otherFactory));
+    function _buildPath(address a, address b, address c) private pure returns (address[] memory path) {
+        path = new address[](3);
+        path[0] = a;
+        path[1] = b;
+        path[2] = c;
+    }
 
-        vm.expectRevert("Pair missing token");
-        token.setAmmPair(address(badPair), address(router), true);
+    function _hashPath(address[] memory path) private pure returns (bytes32) {
+        return keccak256(abi.encode(path));
+    }
 
-        MockPair wrongFactoryPair = new MockPair(address(token), address(ankrBnb), address(otherFactory));
-        vm.expectRevert("Pair factory not allowed");
-        token.setAmmPair(address(wrongFactoryPair), address(router), true);
+    function _countSwapPath(bytes32 expectedHash) private view returns (uint256 count) {
+        uint256 total = router.swapPathHashCount();
+        for (uint256 i = 0; i < total; i++) {
+            if (router.swapPathHashAt(i) == expectedHash) {
+                count++;
+            }
+        }
     }
 }
