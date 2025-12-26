@@ -8,6 +8,40 @@ import {MockFactory} from "./mocks/MockFactory.sol";
 import {MockPair} from "./mocks/MockPair.sol";
 import {MockRouter} from "./mocks/MockRouter.sol";
 
+contract ToggleRouterFactory {
+    address public factoryAddress;
+    bool public revertFactory;
+
+    constructor(address factory_) {
+        factoryAddress = factory_;
+    }
+
+    function setRevertFactory(bool value) external {
+        revertFactory = value;
+    }
+
+    function factory() external view returns (address) {
+        if (revertFactory) {
+            revert("factory revert");
+        }
+        return factoryAddress;
+    }
+}
+
+contract RevertingPair {
+    function token0() external pure returns (address) {
+        revert("token0 revert");
+    }
+
+    function token1() external pure returns (address) {
+        revert("token1 revert");
+    }
+
+    function factory() external pure returns (address) {
+        revert("factory revert");
+    }
+}
+
 contract ReflectionTokenV2Test is Test {
     ReflectionTokenV2 private token;
     MockFactory private factory;
@@ -18,6 +52,7 @@ contract ReflectionTokenV2Test is Test {
     MockPair private pair;
 
     address private alice = address(0xA11CE);
+    address private bob = address(0xB0B);
 
     function setUp() public {
         factory = new MockFactory();
@@ -180,6 +215,76 @@ contract ReflectionTokenV2Test is Test {
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
+    function testRouterRemovalSkipsFactoryCheck() public {
+        ToggleRouterFactory toggleRouter = new ToggleRouterFactory(address(factory));
+        token.setRouterAllowed(address(toggleRouter), true);
+
+        toggleRouter.setRevertFactory(true);
+        token.setRouterAllowed(address(toggleRouter), false);
+
+        assertFalse(token.routerAllowed(address(toggleRouter)));
+    }
+
+    function testSetAmmPairRequiresFactoryPairMatch() public {
+        MockPair spoofPair = new MockPair(address(token), address(ankrBnb), address(factory));
+
+        vm.expectRevert("Pair not in factory");
+        token.setAmmPair(address(spoofPair), address(router), true);
+    }
+
+    function testSetAmmPairDisableSkipsPairCalls() public {
+        RevertingPair badPair = new RevertingPair();
+
+        token.setAmmPair(address(badPair), address(router), false);
+
+        assertFalse(token.ammPairs(address(badPair)));
+        assertEq(token.pairRouter(address(badPair)), address(0));
+    }
+
+    function testSetPathRejectsZeroAddress() public {
+        address[] memory path = new address[](3);
+        path[0] = address(token);
+        path[1] = address(0);
+        path[2] = address(ankrBnb);
+
+        vm.expectRevert("Zero address in path");
+        token.setPath(address(router), address(token), address(ankrBnb), path);
+    }
+
+    function testSwapBackBucketAccountingAddLiquidityFailure() public {
+        router.setQuotedAmountOut(10e18);
+        router.setFailAddLiquidity(true);
+        token.setSwapSettings(1e18, 40e18);
+        token.setSwapEnabled(true);
+
+        uint256 sellAmount = 10_000e18;
+        token.transfer(alice, sellAmount);
+
+        vm.prank(alice);
+        token.transfer(address(pair), sellAmount);
+
+        assertEq(token.tokensForLiquidity(), 20e18);
+        assertEq(token.tokensForBuyback(), 20e18);
+        assertGt(token.balanceOf(address(pair)), 200_000e18);
+    }
+
+    function testSwapBackBucketAccountingSwapFailure() public {
+        router.setQuotedAmountOut(10e18);
+        router.setFailSwap(true);
+        token.setSwapSettings(1e18, 40e18);
+        token.setSwapEnabled(true);
+
+        uint256 sellAmount = 10_000e18;
+        token.transfer(alice, sellAmount);
+
+        vm.prank(alice);
+        token.transfer(address(pair), sellAmount);
+
+        assertEq(token.tokensForLiquidity(), 40e18);
+        assertEq(token.tokensForBuyback(), 40e18);
+        assertGt(token.balanceOf(address(pair)), 200_000e18);
+    }
+
     function testFeeCapEnforced() public {
         uint256 totalFee = token.reflectionFeeBps() + token.liquidityFeeBps() + token.buybackFeeBps();
         assertEq(totalFee, 100);
@@ -335,6 +440,40 @@ contract ReflectionTokenV2Test is Test {
         bytes32 rTotalSlot = bytes32(uint256(3));
         vm.store(address(token), rTotalSlot, bytes32(uint256(0)));
         assertEq(token.getRate(), 1);
+    }
+
+    function testReflectionStressInvariants() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 500e18);
+        token.setSwapEnabled(true);
+        token.setBuybackSettings(0, 10e18, 0);
+
+        token.transfer(alice, 50_000e18);
+        token.transfer(bob, 50_000e18);
+
+        for (uint256 i = 0; i < 20; i++) {
+            vm.prank(address(pair));
+            token.transfer(alice, 1_000e18);
+            vm.prank(address(pair));
+            token.transfer(bob, 1_000e18);
+            vm.prank(alice);
+            token.transfer(address(pair), 800e18);
+            vm.prank(bob);
+            token.transfer(address(pair), 800e18);
+        }
+
+        assertEq(token.totalSupply(), 1_000_000e18);
+
+        uint256 rate = token.getRate();
+        uint256 amount = 12_345e18;
+        uint256 reflected = amount * rate;
+        uint256 recovered = token.tokenFromReflection(reflected);
+        assertApproxEqAbs(recovered, amount, 1);
+
+        uint256 sumBalances = token.balanceOf(address(this)) + token.balanceOf(alice) + token.balanceOf(bob)
+            + token.balanceOf(address(pair)) + token.balanceOf(address(token)) + token.balanceOf(address(router))
+            + token.balanceOf(token.DEAD());
+        assertApproxEqAbs(sumBalances, token.totalSupply(), 10);
     }
 
     function _buildPath(address a, address b, address c) private pure returns (address[] memory path) {
