@@ -14,6 +14,35 @@ interface IERC20 {
     function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
 }
 
+library SafeERC20 {
+    function forceApprove(IERC20 token, address spender, uint256 value) internal {
+        if (_callOptionalReturnBool(token, abi.encodeWithSelector(token.approve.selector, spender, value))) {
+            return;
+        }
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+    }
+
+    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {
+        (bool success, bytes memory returndata) = address(token).call(data);
+        if (!success) {
+            return false;
+        }
+        if (returndata.length == 0) {
+            return true;
+        }
+        return abi.decode(returndata, (bool));
+    }
+
+    function _callOptionalReturn(IERC20 token, bytes memory data) private {
+        (bool success, bytes memory returndata) = address(token).call(data);
+        require(success, "SafeERC20: call failed");
+        if (returndata.length > 0) {
+            require(abi.decode(returndata, (bool)), "SafeERC20: operation failed");
+        }
+    }
+}
+
 abstract contract Ownable {
     address public owner;
 
@@ -42,6 +71,8 @@ abstract contract Ownable {
 }
 
 contract ReflectionTokenV2 is IERC20, Ownable {
+    using SafeERC20 for IERC20;
+
     string public name;
     string public symbol;
     uint8 public immutable decimals = 18;
@@ -79,6 +110,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(bytes32 => address[]) private _path;
 
     bool public swapEnabled;
+    bool private _swapEnabledOnce;
     uint256 public swapThreshold;
     uint256 public maxSwapAmount;
     uint16 public slippageBps = 100;
@@ -94,6 +126,11 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint256 public buybackUpperLimitAnkr;
     uint256 public lastBuybackTimestamp;
     bool public configFinalized;
+    address public buybackRouter;
+
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
 
     uint256 public constant TOTAL_SUPPLY = 1_000_000e18;
     uint256 public constant DEFAULT_SWAP_THRESHOLD = 100e18;
@@ -122,7 +159,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         _rOwned[msg.sender] = _rTotal;
         emit Transfer(address(0), msg.sender, _tTotal);
 
-        swapEnabled = true;
+        _status = _NOT_ENTERED;
+        swapEnabled = false;
         swapThreshold = DEFAULT_SWAP_THRESHOLD;
         maxSwapAmount = DEFAULT_MAX_SWAP_AMOUNT;
         buybackCooldownSeconds = DEFAULT_BUYBACK_COOLDOWN;
@@ -141,6 +179,13 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     modifier onlyConfigurable() {
         require(!configFinalized, "Config finalized");
         _;
+    }
+
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrancy");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
     }
 
     function totalSupply() external view override returns (uint256) {
@@ -280,10 +325,20 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function setSwapEnabled(bool enabled) external onlyOwner {
-        if (configFinalized) {
-            require(!enabled, "Config finalized");
+        if (enabled) {
+            require(configFinalized, "Config not finalized");
+            require(!swapEnabled, "Swap already enabled");
+            require(!_swapEnabledOnce, "Swap enable locked");
+            swapEnabled = true;
+            _swapEnabledOnce = true;
+        } else {
+            swapEnabled = false;
         }
-        swapEnabled = enabled;
+    }
+
+    function setBuybackRouter(address router) external onlyOwner onlyConfigurable {
+        require(routerAllowed[router], "Router not allowed");
+        buybackRouter = router;
     }
 
     function _approve(address owner_, address spender, uint256 amount) internal {
@@ -296,7 +351,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         require(from != address(0) && to != address(0), "Zero address");
         require(amount > 0, "Amount zero");
 
-        bool takeFee = ammPairs[from] || ammPairs[to];
+        bool takeFee = (ammPairs[from] || ammPairs[to]) && to != DEAD;
 
         if (takeFee) {
             _tokenTransferWithFee(from, to, amount);
@@ -305,7 +360,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
 
         bool isSell = ammPairs[to];
-        if (isSell && swapEnabled && !_inSwap) {
+        if (isSell && swapEnabled && configFinalized && !_inSwap) {
             uint256 contractTokenBalance = balanceOf(address(this));
             if (contractTokenBalance >= swapThreshold) {
                 _swapBack(pairRouter[to]);
@@ -360,6 +415,9 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     function _swapBack(address router) internal {
         if (_inSwap) {
+            return;
+        }
+        if (!swapEnabled || !configFinalized) {
             return;
         }
         if (router == address(0) || !routerAllowed[router]) {
@@ -429,7 +487,6 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             }
         }
 
-        _executeBuyback(router);
         _inSwap = false;
 
         emit SwapBack(swapAmount);
@@ -465,7 +522,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         if (amountOutMin == 0) {
             return false;
         }
-        _approve(address(this), router, amount);
+        IERC20(address(this)).forceApprove(router, amount);
         try IUniswapV2Router02(router)
             .swapExactTokensForTokensSupportingFeeOnTransferTokens(
                 amount, amountOutMin, path, address(this), block.timestamp
@@ -477,8 +534,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function _addLiquidity(address router, uint256 tokenAmount, uint256 ankrAmount) internal returns (bool) {
-        _approve(address(this), router, tokenAmount);
-        IERC20(ANKRBNB).approve(router, ankrAmount);
+        IERC20(address(this)).forceApprove(router, tokenAmount);
+        IERC20(ANKRBNB).forceApprove(router, ankrAmount);
         uint256 minToken = (tokenAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM;
         uint256 minAnkr = (ankrAmount * (BPS_DENOM - slippageBps)) / BPS_DENOM;
         try IUniswapV2Router02(router)
@@ -502,59 +559,72 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function _executeBuyback(address router) internal {
-        if (router == address(0) || !routerAllowed[router]) {
-            return;
+    function buyback(uint256 ankrAmountIn, uint256 minOut, uint256 deadline) external nonReentrant returns (bool) {
+        if (!swapEnabled || !configFinalized) {
+            return false;
+        }
+        if (deadline < block.timestamp) {
+            return false;
         }
         if (block.timestamp < lastBuybackTimestamp + buybackCooldownSeconds) {
-            return;
+            return false;
+        }
+        address router = buybackRouter;
+        if (router == address(0) || !routerAllowed[router]) {
+            return false;
         }
         uint256 ankrBalance = IERC20(ANKRBNB).balanceOf(address(this));
         if (ankrBalance == 0) {
-            return;
+            return false;
         }
-        if (buybackUpperLimitAnkr > 0 && ankrBalance > buybackUpperLimitAnkr) {
-            ankrBalance = buybackUpperLimitAnkr;
+        uint256 amountIn = ankrAmountIn == 0 ? ankrBalance : ankrAmountIn;
+        if (amountIn > ankrBalance) {
+            amountIn = ankrBalance;
         }
-        if (maxBuybackAnkr > 0 && ankrBalance > maxBuybackAnkr) {
-            ankrBalance = maxBuybackAnkr;
+        if (buybackUpperLimitAnkr > 0 && amountIn > buybackUpperLimitAnkr) {
+            amountIn = buybackUpperLimitAnkr;
         }
-        if (ankrBalance == 0) {
-            return;
+        if (maxBuybackAnkr > 0 && amountIn > maxBuybackAnkr) {
+            amountIn = maxBuybackAnkr;
+        }
+        if (amountIn == 0) {
+            return false;
         }
         address factory;
         try IUniswapV2Router02(router).factory() returns (address factoryAddress) {
             factory = factoryAddress;
         } catch {
-            return;
+            return false;
         }
         address pair;
         try IUniswapV2Factory(factory).getPair(ANKRBNB, address(this)) returns (address pairAddress) {
             pair = pairAddress;
         } catch {
-            return;
+            return false;
         }
         if (pair == address(0) || pair.code.length == 0) {
-            return;
+            return false;
         }
-        uint256 impactBps = _estimatePriceImpactBps(pair, ANKRBNB, ankrBalance);
+        uint256 impactBps = _estimatePriceImpactBps(pair, ANKRBNB, amountIn);
         if (impactBps > maxBuybackPriceImpactBps) {
-            return;
+            return false;
         }
         address[] memory path = _getPath(router, ANKRBNB, address(this));
-        uint256 amountOutMin = _quoteAmountOutMin(router, ankrBalance, path);
+        uint256 amountOutMin = _quoteAmountOutMin(router, amountIn, path);
         if (amountOutMin == 0) {
-            return;
+            return false;
         }
-        IERC20(ANKRBNB).approve(router, ankrBalance);
+        if (minOut > amountOutMin) {
+            amountOutMin = minOut;
+        }
+        IERC20(ANKRBNB).forceApprove(router, amountIn);
         try IUniswapV2Router02(router)
-            .swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                ankrBalance, amountOutMin, path, DEAD, block.timestamp
-            ) {
+            .swapExactTokensForTokensSupportingFeeOnTransferTokens(amountIn, amountOutMin, path, DEAD, deadline) {
             lastBuybackTimestamp = block.timestamp;
-            emit Buyback(router, ankrBalance);
+            emit Buyback(router, amountIn);
+            return true;
         } catch {
-            return;
+            return false;
         }
     }
 
