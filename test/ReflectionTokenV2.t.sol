@@ -45,6 +45,14 @@ contract RevertingPair {
 contract ReflectionTokenV2Test is Test {
     event Transfer(address indexed from, address indexed to, uint256 value);
 
+    bytes4 private constant CONFIG_FINALIZED = bytes4(keccak256("ConfigFinalizedError()"));
+    bytes4 private constant PAIR_NOT_IN_FACTORY = bytes4(keccak256("PairNotInFactory()"));
+    bytes4 private constant ZERO_ADDRESS_IN_PATH = bytes4(keccak256("ZeroAddressInPath()"));
+    bytes4 private constant SWAP_ENABLE_LOCKED = bytes4(keccak256("SwapEnableLocked()"));
+    bytes4 private constant NOT_OWNER = bytes4(keccak256("NotOwner()"));
+    bytes4 private constant SLIPPAGE_TOO_HIGH = bytes4(keccak256("SlippageTooHigh()"));
+    bytes4 private constant SWAP_NOT_FINALIZED = bytes4(keccak256("SwapNotFinalized()"));
+
     ReflectionTokenV2 private token;
     MockFactory private factory;
     MockRouter private router;
@@ -256,7 +264,7 @@ contract ReflectionTokenV2Test is Test {
     function testSetAmmPairRequiresFactoryPairMatch() public {
         MockPair spoofPair = new MockPair(address(token), address(ankrBnb), address(factory));
 
-        vm.expectRevert("Pair not in factory");
+        vm.expectRevert(abi.encodeWithSelector(PAIR_NOT_IN_FACTORY));
         token.setAmmPair(address(spoofPair), address(router), true);
     }
 
@@ -275,7 +283,7 @@ contract ReflectionTokenV2Test is Test {
         path[1] = address(0);
         path[2] = address(ankrBnb);
 
-        vm.expectRevert("Zero address in path");
+        vm.expectRevert(abi.encodeWithSelector(ZERO_ADDRESS_IN_PATH));
         token.setPath(address(router), address(token), address(ankrBnb), path);
     }
 
@@ -401,35 +409,35 @@ contract ReflectionTokenV2Test is Test {
     function testFinalizeConfigLocksChanges() public {
         token.finalizeConfig();
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setFactoryAllowed(address(factory), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setRouterAllowed(address(router), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setAmmPair(address(pair), address(router), false);
 
         address[] memory path = new address[](2);
         path[0] = address(token);
         path[1] = address(ankrBnb);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setPath(address(router), address(token), address(ankrBnb), path);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setSwapSettings(2e18, 10_000e18);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setSlippageBps(200);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setBuybackSettings(0, 1e18, 2e18);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setHopTokenAllowed(address(wbnb), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setMaxBuybackPriceImpactBps(300);
     }
 
@@ -439,7 +447,7 @@ contract ReflectionTokenV2Test is Test {
         token.setSwapEnabled(false);
         assertFalse(token.swapEnabled());
 
-        vm.expectRevert("Swap enable locked");
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLE_LOCKED));
         token.setSwapEnabled(true);
     }
 
@@ -467,10 +475,10 @@ contract ReflectionTokenV2Test is Test {
     function testRenounceOwnershipLocksAdmin() public {
         token.renounceOwnership();
 
-        vm.expectRevert("Not owner");
+        vm.expectRevert(abi.encodeWithSelector(NOT_OWNER));
         token.setSwapEnabled(false);
 
-        vm.expectRevert("Not owner");
+        vm.expectRevert(abi.encodeWithSelector(NOT_OWNER));
         token.finalizeConfig();
 
         uint256 amount = 1_000e18;
@@ -479,8 +487,8 @@ contract ReflectionTokenV2Test is Test {
     }
 
     function testSlippageBounded() public {
-        vm.expectRevert("Slippage too high");
-        token.setSlippageBps(501);
+        vm.expectRevert(abi.encodeWithSelector(SLIPPAGE_TOO_HIGH));
+        token.setSlippageBps(1001);
     }
 
     function testRateGuardrails() public {
@@ -524,7 +532,7 @@ contract ReflectionTokenV2Test is Test {
     }
 
     function testFinalizeConfigRequiresBeforeEnable() public {
-        vm.expectRevert("Config not finalized");
+        vm.expectRevert(abi.encodeWithSelector(SWAP_NOT_FINALIZED));
         token.setSwapEnabled(true);
     }
 
