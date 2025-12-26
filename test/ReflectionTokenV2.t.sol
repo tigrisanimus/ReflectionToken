@@ -43,6 +43,8 @@ contract RevertingPair {
 }
 
 contract ReflectionTokenV2Test is Test {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
     ReflectionTokenV2 private token;
     MockFactory private factory;
     MockRouter private router;
@@ -84,6 +86,7 @@ contract ReflectionTokenV2Test is Test {
 
         pair = new MockPair(address(token), address(ankrBnb), address(factory));
         factory.setPair(address(token), address(ankrBnb), address(pair));
+        pair.setReserves(1_000_000e18, 1_000_000e18);
 
         token.transfer(address(pair), 200_000e18);
         token.setAmmPair(address(pair), address(router), true);
@@ -112,11 +115,14 @@ contract ReflectionTokenV2Test is Test {
         uint256 expectedFee = (amount * 100) / 10_000;
         uint256 expectedContract = (amount * 80) / 10_000;
 
+        vm.expectEmit(true, true, true, true);
+        emit Transfer(address(pair), alice, amount - expectedFee);
+        vm.expectEmit(true, true, true, true);
+        emit Transfer(address(pair), address(token), expectedContract);
+
         vm.prank(address(pair));
         token.transfer(alice, amount);
 
-        assertGe(token.balanceOf(alice), amount - expectedFee);
-        assertGe(token.balanceOf(address(token)), expectedContract);
         assertEq(token.tokensForLiquidity(), (amount * 40) / 10_000);
         assertEq(token.tokensForBuyback(), (amount * 40) / 10_000);
     }
@@ -125,10 +131,17 @@ contract ReflectionTokenV2Test is Test {
         uint256 amount = 5_000e18;
         token.transfer(alice, amount);
 
+        uint256 expectedFee = (amount * 100) / 10_000;
+        uint256 expectedContract = (amount * 80) / 10_000;
+
+        vm.expectEmit(true, true, true, true);
+        emit Transfer(alice, address(pair), amount - expectedFee);
+        vm.expectEmit(true, true, true, true);
+        emit Transfer(alice, address(token), expectedContract);
+
         vm.prank(alice);
         token.transfer(address(pair), amount);
 
-        uint256 expectedFee = (amount * 100) / 10_000;
         assertGe(token.balanceOf(address(pair)), 200_000e18 + amount - expectedFee);
         assertEq(token.tokensForLiquidity(), (amount * 40) / 10_000);
         assertEq(token.tokensForBuyback(), (amount * 40) / 10_000);
@@ -322,6 +335,7 @@ contract ReflectionTokenV2Test is Test {
 
     function testSwapDisabledStillAllowsTransfers() public {
         router.setQuotedAmountOut(10e18);
+        token.setSwapEnabled(false);
         assertFalse(token.swapEnabled());
 
         token.transfer(alice, 5_000e18);
@@ -342,6 +356,8 @@ contract ReflectionTokenV2Test is Test {
         token.transfer(address(pair), 5_000e18);
 
         assertEq(router.swapPathHashCount(), 0);
+        assertEq(token.tokensForLiquidity(), 20e18);
+        assertEq(token.tokensForBuyback(), 20e18);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
@@ -355,6 +371,8 @@ contract ReflectionTokenV2Test is Test {
         token.transfer(address(pair), 5_000e18);
 
         assertEq(router.swapPathHashCount(), 0);
+        assertEq(token.tokensForLiquidity(), 20e18);
+        assertEq(token.tokensForBuyback(), 20e18);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
@@ -404,6 +422,9 @@ contract ReflectionTokenV2Test is Test {
 
         vm.expectRevert("Config finalized");
         token.setHopTokenAllowed(address(wbnb), false);
+
+        vm.expectRevert("Config finalized");
+        token.setMaxBuybackPriceImpactBps(300);
     }
 
     function testFinalizeConfigAllowsSwapDisableOnly() public {
@@ -415,6 +436,23 @@ contract ReflectionTokenV2Test is Test {
 
         vm.expectRevert("Config finalized");
         token.setSwapEnabled(true);
+    }
+
+    function testBuybackPriceImpactCapSkips() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18);
+        token.setSwapEnabled(true);
+        token.setBuybackSettings(0, 5e18, 0);
+        token.setMaxBuybackPriceImpactBps(50);
+
+        pair.setReserves(1e18, 1e18);
+
+        token.transfer(alice, 20_000e18);
+        vm.prank(alice);
+        token.transfer(address(pair), 20_000e18);
+
+        bytes32 expectedBuybackPath = _hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)));
+        assertEq(_countSwapPath(expectedBuybackPath), 0);
     }
 
     function testRenounceOwnershipLocksAdmin() public {

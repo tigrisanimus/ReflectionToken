@@ -65,6 +65,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint16 public constant MAX_TOTAL_FEE_BPS = 100;
 
     address public immutable ANKRBNB;
+    address public constant WBNB = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
+    address public constant BUSD = 0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56;
+    address public constant USDT = 0x55d398326f99059fF775485246999027B3197955;
+    address public constant USDC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
 
     mapping(address => bool) public ammPairs;
     mapping(address => bool) public routerAllowed;
@@ -78,6 +82,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint256 public swapThreshold;
     uint256 public maxSwapAmount;
     uint16 public slippageBps = 100;
+    uint16 public maxBuybackPriceImpactBps = 200;
 
     uint256 public tokensForLiquidity;
     uint256 public tokensForBuyback;
@@ -100,6 +105,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint256 public constant MAX_SWAP_AMOUNT_BPS = 100;
     uint256 public constant MAX_BUYBACK_COOLDOWN = 1 days;
     uint256 public constant MAX_BUYBACK_ANKR = 100e18;
+    uint16 public constant MAX_BUYBACK_PRICE_IMPACT_BPS = 500;
 
     event SwapBack(uint256 tokensSwapped);
     event Buyback(address indexed router, uint256 amountIn);
@@ -116,12 +122,17 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         _rOwned[msg.sender] = _rTotal;
         emit Transfer(address(0), msg.sender, _tTotal);
 
-        swapEnabled = false;
+        swapEnabled = true;
         swapThreshold = DEFAULT_SWAP_THRESHOLD;
         maxSwapAmount = DEFAULT_MAX_SWAP_AMOUNT;
         buybackCooldownSeconds = DEFAULT_BUYBACK_COOLDOWN;
         maxBuybackAnkr = DEFAULT_MAX_BUYBACK_ANKR;
         buybackUpperLimitAnkr = DEFAULT_BUYBACK_UPPER_LIMIT_ANKR;
+        hopTokenAllowed[ANKRBNB] = true;
+        hopTokenAllowed[WBNB] = true;
+        hopTokenAllowed[BUSD] = true;
+        hopTokenAllowed[USDT] = true;
+        hopTokenAllowed[USDC] = true;
         _enforceFeeCap();
         _enforceSwapLimits(swapThreshold, maxSwapAmount);
         _enforceBuybackLimits(buybackCooldownSeconds, maxBuybackAnkr, buybackUpperLimitAnkr);
@@ -176,7 +187,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return _getPath(router, tokenIn, tokenOut);
     }
 
-    function finalizeConfig() external onlyOwner {
+    function finalizeConfig() external onlyOwner onlyConfigurable {
         configFinalized = true;
         emit ConfigFinalized();
     }
@@ -261,6 +272,11 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         buybackCooldownSeconds = cooldownSeconds;
         maxBuybackAnkr = maxPerCall;
         buybackUpperLimitAnkr = upperLimit;
+    }
+
+    function setMaxBuybackPriceImpactBps(uint16 newImpactBps) external onlyOwner onlyConfigurable {
+        require(newImpactBps <= MAX_BUYBACK_PRICE_IMPACT_BPS, "Impact too high");
+        maxBuybackPriceImpactBps = newImpactBps;
     }
 
     function setSwapEnabled(bool enabled) external onlyOwner {
@@ -506,6 +522,25 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         if (ankrBalance == 0) {
             return;
         }
+        address factory;
+        try IUniswapV2Router02(router).factory() returns (address factoryAddress) {
+            factory = factoryAddress;
+        } catch {
+            return;
+        }
+        address pair;
+        try IUniswapV2Factory(factory).getPair(ANKRBNB, address(this)) returns (address pairAddress) {
+            pair = pairAddress;
+        } catch {
+            return;
+        }
+        if (pair == address(0) || pair.code.length == 0) {
+            return;
+        }
+        uint256 impactBps = _estimatePriceImpactBps(pair, ANKRBNB, ankrBalance);
+        if (impactBps > maxBuybackPriceImpactBps) {
+            return;
+        }
         address[] memory path = _getPath(router, ANKRBNB, address(this));
         uint256 amountOutMin = _quoteAmountOutMin(router, ankrBalance, path);
         if (amountOutMin == 0) {
@@ -520,6 +555,45 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             emit Buyback(router, ankrBalance);
         } catch {
             return;
+        }
+    }
+
+    function _estimatePriceImpactBps(address pair, address tokenIn, uint256 amountIn) internal view returns (uint256) {
+        if (amountIn == 0) {
+            return 0;
+        }
+        address token0;
+        address token1;
+        try IUniswapV2Pair(pair).token0() returns (address token0Address) {
+            token0 = token0Address;
+        } catch {
+            return BPS_DENOM;
+        }
+        try IUniswapV2Pair(pair).token1() returns (address token1Address) {
+            token1 = token1Address;
+        } catch {
+            return BPS_DENOM;
+        }
+        (uint112 reserve0, uint112 reserve1,) = _safeGetReserves(pair);
+        uint256 reserveIn;
+        if (tokenIn == token0) {
+            reserveIn = reserve0;
+        } else if (tokenIn == token1) {
+            reserveIn = reserve1;
+        } else {
+            return BPS_DENOM;
+        }
+        if (reserveIn == 0) {
+            return BPS_DENOM;
+        }
+        return (amountIn * BPS_DENOM) / (reserveIn + amountIn);
+    }
+
+    function _safeGetReserves(address pair) internal view returns (uint112, uint112, uint32) {
+        try IUniswapV2Pair(pair).getReserves() returns (uint112 reserve0, uint112 reserve1, uint32 timestampLast) {
+            return (reserve0, reserve1, timestampLast);
+        } catch {
+            return (0, 0, 0);
         }
     }
 
