@@ -45,6 +45,14 @@ contract RevertingPair {
 contract ReflectionTokenV2Test is Test {
     event Transfer(address indexed from, address indexed to, uint256 value);
 
+    bytes4 private constant CONFIG_FINALIZED = bytes4(keccak256("ConfigFinalizedError()"));
+    bytes4 private constant PAIR_NOT_IN_FACTORY = bytes4(keccak256("PairNotInFactory()"));
+    bytes4 private constant ZERO_ADDRESS_IN_PATH = bytes4(keccak256("ZeroAddressInPath()"));
+    bytes4 private constant SWAP_ENABLE_LOCKED = bytes4(keccak256("SwapEnableLocked()"));
+    bytes4 private constant NOT_OWNER = bytes4(keccak256("NotOwner()"));
+    bytes4 private constant SLIPPAGE_TOO_HIGH = bytes4(keccak256("SlippageTooHigh()"));
+    bytes4 private constant SWAP_NOT_FINALIZED = bytes4(keccak256("SwapNotFinalized()"));
+
     ReflectionTokenV2 private token;
     MockFactory private factory;
     MockRouter private router;
@@ -67,6 +75,7 @@ contract ReflectionTokenV2Test is Test {
 
         token.setFactoryAllowed(address(factory), true);
         token.setRouterAllowed(address(router), true);
+        token.setBuybackRouter(address(router));
 
         token.setHopTokenAllowed(address(wbnb), true);
         token.setHopTokenAllowed(address(ankrBnb), true);
@@ -127,6 +136,16 @@ contract ReflectionTokenV2Test is Test {
         assertEq(token.tokensForBuyback(), (amount * 40) / 10_000);
     }
 
+    function testBurnTransferNoFee() public {
+        uint256 amount = 10_000e18;
+        uint256 contractBalanceBefore = token.balanceOf(address(token));
+        token.transfer(token.DEAD(), amount);
+        assertEq(token.balanceOf(token.DEAD()), amount);
+        assertEq(token.balanceOf(address(token)), contractBalanceBefore);
+        assertEq(token.tokensForLiquidity(), 0);
+        assertEq(token.tokensForBuyback(), 0);
+    }
+
     function testSellAppliesFees() public {
         uint256 amount = 5_000e18;
         token.transfer(alice, amount);
@@ -150,8 +169,8 @@ contract ReflectionTokenV2Test is Test {
     function testSwapBackOnSellAddsLiquidityAndBuyback() public {
         router.setQuotedAmountOut(10e18);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
         token.setBuybackSettings(0, 1e18, 2e18);
+        _finalizeAndEnableSwaps();
 
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, 40_000e18);
@@ -163,19 +182,22 @@ contract ReflectionTokenV2Test is Test {
         assertEq(router.lastAddLiquidityTokenB(), address(ankrBnb));
         assertEq(router.lastAddLiquidityTo(), token.DEAD());
         assertGt(ankrBnb.balanceOf(address(token)), 0);
-        assertGt(token.balanceOf(token.DEAD()), 0);
+        assertEq(token.balanceOf(token.DEAD()), 0);
     }
 
     function testMultiHopPathUsage() public {
         router.setQuotedAmountOut(10e18);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
         token.setBuybackSettings(0, 5e18, 0);
+        _finalizeAndEnableSwaps();
 
         token.transfer(alice, 20_000e18);
 
         vm.prank(alice);
         token.transfer(address(pair), 20_000e18);
+
+        vm.warp(1000);
+        token.buyback(5e18, 1, block.timestamp + 100);
 
         bytes32 expectedTokenToAnkr = _hashPath(_buildPath(address(token), address(wbnb), address(ankrBnb)));
         bytes32 expectedAnkrToToken = _hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)));
@@ -200,6 +222,7 @@ contract ReflectionTokenV2Test is Test {
     function testRouterFailureDoesNotRevert() public {
         MockRouter failingRouter = new MockRouter(address(factory));
         token.setRouterAllowed(address(failingRouter), true);
+        token.setBuybackRouter(address(failingRouter));
 
         address[] memory pathToAnkr = new address[](3);
         pathToAnkr[0] = address(token);
@@ -219,7 +242,7 @@ contract ReflectionTokenV2Test is Test {
         failingRouter.setFailAddLiquidity(true);
 
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
         token.transfer(alice, 5_000e18);
 
         vm.prank(alice);
@@ -241,7 +264,7 @@ contract ReflectionTokenV2Test is Test {
     function testSetAmmPairRequiresFactoryPairMatch() public {
         MockPair spoofPair = new MockPair(address(token), address(ankrBnb), address(factory));
 
-        vm.expectRevert("Pair not in factory");
+        vm.expectRevert(abi.encodeWithSelector(PAIR_NOT_IN_FACTORY));
         token.setAmmPair(address(spoofPair), address(router), true);
     }
 
@@ -260,7 +283,7 @@ contract ReflectionTokenV2Test is Test {
         path[1] = address(0);
         path[2] = address(ankrBnb);
 
-        vm.expectRevert("Zero address in path");
+        vm.expectRevert(abi.encodeWithSelector(ZERO_ADDRESS_IN_PATH));
         token.setPath(address(router), address(token), address(ankrBnb), path);
     }
 
@@ -268,7 +291,7 @@ contract ReflectionTokenV2Test is Test {
         router.setQuotedAmountOut(10e18);
         router.setFailAddLiquidity(true);
         token.setSwapSettings(1e18, 40e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
 
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, sellAmount);
@@ -285,7 +308,7 @@ contract ReflectionTokenV2Test is Test {
         router.setQuotedAmountOut(10e18);
         router.setFailSwap(true);
         token.setSwapSettings(1e18, 40e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
 
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, sellAmount);
@@ -306,8 +329,8 @@ contract ReflectionTokenV2Test is Test {
     function testCooldownEnforcedForBuyback() public {
         router.setQuotedAmountOut(10e18);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
         token.setBuybackSettings(1000, 5e18, 0);
+        _finalizeAndEnableSwaps();
 
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, 40_000e18);
@@ -319,23 +342,17 @@ contract ReflectionTokenV2Test is Test {
         assertEq(deadBalance, 0);
 
         vm.warp(2000);
-        vm.prank(alice);
-        token.transfer(address(pair), sellAmount);
-
+        bool first = token.buyback(5e18, 1, block.timestamp + 100);
+        assertTrue(first);
         uint256 afterBuyback = token.balanceOf(token.DEAD());
         assertGt(afterBuyback, 0);
-        uint256 buybackCount = _countSwapPath(_hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token))));
 
-        vm.warp(2001);
-        vm.prank(alice);
-        token.transfer(address(pair), sellAmount);
-
-        assertEq(_countSwapPath(_hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)))), buybackCount);
+        bool second = token.buyback(5e18, 1, block.timestamp + 100);
+        assertFalse(second);
     }
 
     function testSwapDisabledStillAllowsTransfers() public {
         router.setQuotedAmountOut(10e18);
-        token.setSwapEnabled(false);
         assertFalse(token.swapEnabled());
 
         token.transfer(alice, 5_000e18);
@@ -349,7 +366,7 @@ contract ReflectionTokenV2Test is Test {
     function testSwapQuoteFailureDoesNotRevert() public {
         router.setFailGetAmountsOut(true);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
 
         token.transfer(alice, 5_000e18);
         vm.prank(alice);
@@ -364,7 +381,7 @@ contract ReflectionTokenV2Test is Test {
     function testSwapQuoteZeroDoesNotRevert() public {
         router.setQuotedAmountOut(0);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
 
         token.transfer(alice, 5_000e18);
         vm.prank(alice);
@@ -380,7 +397,7 @@ contract ReflectionTokenV2Test is Test {
         router.setQuotedAmountOut(10e18);
         router.setFailAddLiquidity(true);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
+        _finalizeAndEnableSwaps();
 
         token.transfer(alice, 10_000e18);
         vm.prank(alice);
@@ -392,76 +409,76 @@ contract ReflectionTokenV2Test is Test {
     function testFinalizeConfigLocksChanges() public {
         token.finalizeConfig();
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setFactoryAllowed(address(factory), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setRouterAllowed(address(router), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setAmmPair(address(pair), address(router), false);
 
         address[] memory path = new address[](2);
         path[0] = address(token);
         path[1] = address(ankrBnb);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setPath(address(router), address(token), address(ankrBnb), path);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setSwapSettings(2e18, 10_000e18);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setSlippageBps(200);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setBuybackSettings(0, 1e18, 2e18);
 
-        vm.expectRevert("Config finalized");
-        token.setSwapEnabled(true);
-
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setHopTokenAllowed(address(wbnb), false);
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setMaxBuybackPriceImpactBps(300);
     }
 
     function testFinalizeConfigAllowsSwapDisableOnly() public {
-        token.setSwapEnabled(true);
         token.finalizeConfig();
-
+        token.setSwapEnabled(true);
         token.setSwapEnabled(false);
         assertFalse(token.swapEnabled());
 
-        vm.expectRevert("Config finalized");
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLE_LOCKED));
         token.setSwapEnabled(true);
     }
 
     function testBuybackPriceImpactCapSkips() public {
         router.setQuotedAmountOut(10e18);
         token.setSwapSettings(1e18, 10_000e18);
-        token.setSwapEnabled(true);
         token.setBuybackSettings(0, 5e18, 0);
         token.setMaxBuybackPriceImpactBps(50);
+        _finalizeAndEnableSwaps();
 
         pair.setReserves(1e18, 1e18);
 
-        token.transfer(alice, 20_000e18);
+        token.transfer(alice, 21_000e18);
         vm.prank(alice);
         token.transfer(address(pair), 20_000e18);
 
         bytes32 expectedBuybackPath = _hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)));
+        assertEq(_countSwapPath(expectedBuybackPath), 0);
+
+        bool success = token.buyback(5e18, 1, block.timestamp + 100);
+        assertFalse(success);
         assertEq(_countSwapPath(expectedBuybackPath), 0);
     }
 
     function testRenounceOwnershipLocksAdmin() public {
         token.renounceOwnership();
 
-        vm.expectRevert("Not owner");
+        vm.expectRevert(abi.encodeWithSelector(NOT_OWNER));
         token.setSwapEnabled(false);
 
-        vm.expectRevert("Not owner");
+        vm.expectRevert(abi.encodeWithSelector(NOT_OWNER));
         token.finalizeConfig();
 
         uint256 amount = 1_000e18;
@@ -470,8 +487,8 @@ contract ReflectionTokenV2Test is Test {
     }
 
     function testSlippageBounded() public {
-        vm.expectRevert("Slippage too high");
-        token.setSlippageBps(501);
+        vm.expectRevert(abi.encodeWithSelector(SLIPPAGE_TOO_HIGH));
+        token.setSlippageBps(1001);
     }
 
     function testRateGuardrails() public {
@@ -483,8 +500,8 @@ contract ReflectionTokenV2Test is Test {
     function testReflectionStressInvariants() public {
         router.setQuotedAmountOut(10e18);
         token.setSwapSettings(1e18, 500e18);
-        token.setSwapEnabled(true);
         token.setBuybackSettings(0, 10e18, 0);
+        _finalizeAndEnableSwaps();
 
         token.transfer(alice, 50_000e18);
         token.transfer(bob, 50_000e18);
@@ -514,6 +531,48 @@ contract ReflectionTokenV2Test is Test {
         assertApproxEqAbs(sumBalances, token.totalSupply(), 10);
     }
 
+    function testFinalizeConfigRequiresBeforeEnable() public {
+        vm.expectRevert(abi.encodeWithSelector(SWAP_NOT_FINALIZED));
+        token.setSwapEnabled(true);
+    }
+
+    function testBuybackRespectsCapsAndMinOut() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18);
+        token.setBuybackSettings(0, 2e18, 0);
+        _finalizeAndEnableSwaps();
+
+        token.transfer(alice, 21_000e18);
+        vm.prank(alice);
+        token.transfer(address(pair), 20_000e18);
+
+        vm.warp(1000);
+        bool success = token.buyback(5e18, 9e18, block.timestamp + 100);
+        assertTrue(success);
+        assertEq(router.lastAmountOutMin(), 9.9e18);
+        assertGt(token.balanceOf(token.DEAD()), 0);
+    }
+
+    function testBuybackSwapFailureDoesNotAffectTransfers() public {
+        router.setQuotedAmountOut(10e18);
+        router.setFailSwap(true);
+        token.setSwapSettings(1e18, 10_000e18);
+        token.setBuybackSettings(0, 5e18, 0);
+        _finalizeAndEnableSwaps();
+
+        token.transfer(alice, 21_000e18);
+        vm.prank(alice);
+        token.transfer(address(pair), 20_000e18);
+
+        vm.warp(1000);
+        bool success = token.buyback(5e18, 1, block.timestamp + 100);
+        assertFalse(success);
+
+        vm.prank(alice);
+        token.transfer(bob, 1_000e18);
+        assertEq(token.balanceOf(bob), 1_000e18);
+    }
+
     function _buildPath(address a, address b, address c) private pure returns (address[] memory path) {
         path = new address[](3);
         path[0] = a;
@@ -532,5 +591,10 @@ contract ReflectionTokenV2Test is Test {
                 count++;
             }
         }
+    }
+
+    function _finalizeAndEnableSwaps() private {
+        token.finalizeConfig();
+        token.setSwapEnabled(true);
     }
 }
