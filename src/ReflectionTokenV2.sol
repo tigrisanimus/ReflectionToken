@@ -186,16 +186,24 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     }
 
     function setRouterAllowed(address router, bool allowed) external onlyOwner onlyConfigurable {
-        require(factoryAllowed[IUniswapV2Router02(router).factory()], "Factory not allowed");
+        if (allowed) {
+            require(router.code.length > 0, "Router not contract");
+            require(factoryAllowed[IUniswapV2Router02(router).factory()], "Factory not allowed");
+        }
         routerAllowed[router] = allowed;
     }
 
     function setAmmPair(address pair, address router, bool allowed) external onlyOwner onlyConfigurable {
-        address token0 = IUniswapV2Pair(pair).token0();
-        address token1 = IUniswapV2Pair(pair).token1();
-        require(token0 == address(this) || token1 == address(this), "Pair missing token");
-        require(factoryAllowed[IUniswapV2Pair(pair).factory()], "Pair factory not allowed");
-        require(routerAllowed[router], "Router not allowed");
+        if (allowed) {
+            require(pair.code.length > 0, "Pair not contract");
+            address token0 = IUniswapV2Pair(pair).token0();
+            address token1 = IUniswapV2Pair(pair).token1();
+            require(token0 == address(this) || token1 == address(this), "Pair missing token");
+            address factory = IUniswapV2Pair(pair).factory();
+            require(factoryAllowed[factory], "Pair factory not allowed");
+            require(IUniswapV2Factory(factory).getPair(token0, token1) == pair, "Pair not in factory");
+            require(routerAllowed[router], "Router not allowed");
+        }
 
         ammPairs[pair] = allowed;
         if (allowed) {
@@ -220,6 +228,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         require(path[path.length - 1] == tokenOut, "Bad path end");
         for (uint256 i = 0; i < path.length; i++) {
             address hop = path[i];
+            require(hop != address(0), "Zero address in path");
             if (hop == address(this) || hop == tokenIn || hop == tokenOut) {
                 continue;
             }
@@ -327,7 +336,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     function _getRate() internal view returns (uint256) {
         (uint256 rSupply, uint256 tSupply) = _getCurrentSupply();
-        if (rSupply == 0 || tSupply == 0) {
+        if (rSupply == 0 || tSupply == 0 || rSupply < tSupply) {
             return 1;
         }
         return rSupply / tSupply;
@@ -361,19 +370,26 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
         _inSwap = true;
         uint256 remaining = swapAmount;
-        uint256 usedLiquidity;
-        uint256 usedBuyback;
 
         if (tokensForLiquidity > 0 && remaining > 0) {
             uint256 liquidityTarget = tokensForLiquidity;
             if (liquidityTarget > remaining) {
                 liquidityTarget = remaining;
             }
-            usedLiquidity = _processLiquidity(router, liquidityTarget);
-            if (usedLiquidity > remaining) {
-                usedLiquidity = remaining;
+            uint256 beforeBalance = balanceOf(address(this));
+            _processLiquidity(router, liquidityTarget);
+            uint256 afterBalance = balanceOf(address(this));
+            uint256 spent = beforeBalance > afterBalance ? beforeBalance - afterBalance : 0;
+            if (spent > liquidityTarget) {
+                spent = liquidityTarget;
             }
-            remaining -= usedLiquidity;
+            if (spent > remaining) {
+                spent = remaining;
+            }
+            if (spent > 0) {
+                tokensForLiquidity -= spent;
+                remaining -= spent;
+            }
         }
 
         if (tokensForBuyback > 0 && remaining > 0) {
@@ -381,43 +397,47 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             if (buybackTarget > remaining) {
                 buybackTarget = remaining;
             }
-            usedBuyback = _processBuybackSwap(router, buybackTarget);
+            uint256 beforeBalance = balanceOf(address(this));
+            _processBuybackSwap(router, buybackTarget);
+            uint256 afterBalance = balanceOf(address(this));
+            uint256 spent = beforeBalance > afterBalance ? beforeBalance - afterBalance : 0;
+            if (spent > buybackTarget) {
+                spent = buybackTarget;
+            }
+            if (spent > remaining) {
+                spent = remaining;
+            }
+            if (spent > 0) {
+                tokensForBuyback -= spent;
+                remaining -= spent;
+            }
         }
 
         _executeBuyback(router);
-        if (usedLiquidity > 0) {
-            tokensForLiquidity -= usedLiquidity;
-        }
-        if (usedBuyback > 0) {
-            tokensForBuyback -= usedBuyback;
-        }
         _inSwap = false;
 
         emit SwapBack(swapAmount);
     }
 
-    function _processLiquidity(address router, uint256 amount) internal returns (uint256 used) {
+    function _processLiquidity(address router, uint256 amount) internal {
         if (amount == 0) {
-            return 0;
+            return;
         }
         uint256 half = amount / 2;
         uint256 otherHalf = amount - half;
         if (half == 0 || otherHalf == 0) {
-            return 0;
+            return;
         }
         uint256 beforeBalance = IERC20(ANKRBNB).balanceOf(address(this));
         if (!_swapTokensForAnkr(router, otherHalf)) {
-            return 0;
+            return;
         }
         uint256 afterBalance = IERC20(ANKRBNB).balanceOf(address(this));
         uint256 ankrOut = afterBalance - beforeBalance;
         if (ankrOut == 0) {
-            return 0;
+            return;
         }
-        if (!_addLiquidity(router, half, ankrOut)) {
-            return 0;
-        }
-        return amount;
+        _addLiquidity(router, half, ankrOut);
     }
 
     function _swapTokensForAnkr(address router, uint256 amount) internal returns (bool) {
@@ -457,14 +477,13 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function _processBuybackSwap(address router, uint256 tokenAmount) internal returns (uint256 used) {
+    function _processBuybackSwap(address router, uint256 tokenAmount) internal {
         if (tokenAmount == 0) {
-            return 0;
+            return;
         }
         if (!_swapTokensForAnkr(router, tokenAmount)) {
-            return 0;
+            return;
         }
-        used = tokenAmount;
     }
 
     function _executeBuyback(address router) internal {
@@ -550,7 +569,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     function _getCurrentSupply() internal view returns (uint256 rSupply, uint256 tSupply) {
         rSupply = _rTotal;
         tSupply = _tTotal;
-        if (tSupply == 0 || rSupply < tSupply) {
+        if (tSupply == 0 || rSupply == 0 || rSupply < tSupply) {
             return (_rTotal, _tTotal);
         }
     }

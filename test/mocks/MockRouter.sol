@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 interface IERC20Minimal {
     function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
     function transfer(address recipient, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
 }
 
 contract MockRouter {
@@ -57,6 +58,7 @@ contract MockRouter {
         if (failGetAmountsOut) {
             revert("Quote failed");
         }
+        require(path.length >= 2, "Invalid path");
         amounts = new uint256[](path.length);
         amounts[0] = amountIn;
         amounts[path.length - 1] = quotedAmountOut;
@@ -82,7 +84,8 @@ contract MockRouter {
         if (tokenOutAddr.code.length > 0) {
             (bool success,) = tokenOutAddr.call(abi.encodeWithSignature("mint(address,uint256)", to, quotedAmountOut));
             if (!success) {
-                IERC20Minimal(tokenOutAddr).transfer(to, quotedAmountOut);
+                require(IERC20Minimal(tokenOutAddr).balanceOf(address(this)) >= quotedAmountOut, "Router balance low");
+                require(IERC20Minimal(tokenOutAddr).transfer(to, quotedAmountOut), "Transfer out failed");
             }
         }
     }
@@ -103,8 +106,8 @@ contract MockRouter {
         lastAddLiquidityTokenA = tokenA;
         lastAddLiquidityTokenB = tokenB;
         lastAddLiquidityTo = to;
-        IERC20Minimal(tokenA).transferFrom(msg.sender, address(this), amountADesired);
-        IERC20Minimal(tokenB).transferFrom(msg.sender, address(this), amountBDesired);
+        require(IERC20Minimal(tokenA).transferFrom(msg.sender, address(this), amountADesired), "Transfer A failed");
+        require(IERC20Minimal(tokenB).transferFrom(msg.sender, address(this), amountBDesired), "Transfer B failed");
         return (amountADesired, amountBDesired, 1);
     }
 }
