@@ -22,6 +22,7 @@ contract MockRouter {
     address public lastAddLiquidityTokenA;
     address public lastAddLiquidityTokenB;
     address public lastAddLiquidityTo;
+    address public pairRecipient;
 
     bytes32[] public swapPathHashes;
 
@@ -44,6 +45,10 @@ contract MockRouter {
 
     function setQuotedAmountOut(uint256 amountOut) external {
         quotedAmountOut = amountOut;
+    }
+
+    function setPairRecipient(address recipient) external {
+        pairRecipient = recipient;
     }
 
     function swapPathHashAt(uint256 index) external view returns (bytes32) {
@@ -79,7 +84,8 @@ contract MockRouter {
         lastSwapTokenOut = path[path.length - 1];
         lastSwapTo = to;
         swapPathHashes.push(keccak256(abi.encode(path)));
-        require(IERC20Minimal(path[0]).transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
+        address inputRecipient = pairRecipient == address(0) ? address(this) : pairRecipient;
+        require(IERC20Minimal(path[0]).transferFrom(msg.sender, inputRecipient, amountIn), "Transfer in failed");
         address tokenOutAddr = path[path.length - 1];
         if (tokenOutAddr.code.length > 0) {
             (bool success,) = tokenOutAddr.call(abi.encodeWithSignature("mint(address,uint256)", to, quotedAmountOut));

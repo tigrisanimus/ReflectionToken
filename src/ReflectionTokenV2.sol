@@ -49,7 +49,6 @@ interface IUniswapV2RouterMinimal {
 error NotOwner();
 error ZeroAddress();
 error ZeroOwner();
-error AmountZero();
 error AllowanceExceeded();
 error ReflectionAmountExceedsTotal();
 error ConfigFinalizedError();
@@ -80,9 +79,15 @@ error SwapAlreadyEnabled();
 error SwapEnableLocked();
 error Reentrancy();
 error FeeCapExceeded();
+error NotKeeper();
+error RecoverNotAllowed();
 
 library SafeERC20 {
     error SafeERC20Failed();
+
+    function safeTransfer(IERC20 token, address to, uint256 value) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+    }
 
     function forceApprove(IERC20 token, address spender, uint256 value) internal {
         if (_callOptionalReturnBool(token, abi.encodeWithSelector(token.approve.selector, spender, value))) {
@@ -182,6 +187,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(address => bool) public routerAllowed;
     mapping(address => bool) public factoryAllowed;
     mapping(address => address) public pairRouter;
+    mapping(address => bool) public isFeeExempt;
 
     mapping(address => bool) public hopTokenAllowed;
     mapping(bytes32 => address[]) private _path;
@@ -204,6 +210,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint256 public lastBuybackTimestamp;
     bool public configFinalized;
     address public buybackRouter;
+    address public buybackKeeper;
+    bool public recoverAnkrEnabled;
 
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
@@ -224,6 +232,8 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     event SwapBack(uint256 tokensSwapped);
     event Buyback(address indexed router, uint256 amountIn);
     event ConfigFinalized();
+    event ConfigUpdated(bytes32 indexed key, address indexed target, uint256 value, bool flag);
+    event RecoveredERC20(address indexed token, address indexed to, uint256 amount);
 
     constructor(address ankrBnb_) {
         if (ankrBnb_ == address(0)) {
@@ -237,6 +247,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
         _rOwned[msg.sender] = _rTotal;
         emit Transfer(address(0), msg.sender, _tTotal);
+        isFeeExempt[address(this)] = true;
+        isFeeExempt[msg.sender] = true;
+        isFeeExempt[DEAD] = true;
+        buybackKeeper = msg.sender;
 
         _status = _NOT_ENTERED;
         swapEnabled = false;
@@ -269,6 +283,13 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         _status = _ENTERED;
         _;
         _status = _NOT_ENTERED;
+    }
+
+    modifier onlyKeeperOrOwner() {
+        if (msg.sender != owner && msg.sender != buybackKeeper) {
+            revert NotKeeper();
+        }
+        _;
     }
 
     function totalSupply() external view override returns (uint256) {
@@ -322,6 +343,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
     function setFactoryAllowed(address factory, bool allowed) external onlyOwner onlyConfigurable {
         factoryAllowed[factory] = allowed;
+        emit ConfigUpdated(keccak256("FACTORY_ALLOWED"), factory, 0, allowed);
     }
 
     function setRouterAllowed(address router, bool allowed) external onlyOwner onlyConfigurable {
@@ -334,6 +356,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             }
         }
         routerAllowed[router] = allowed;
+        emit ConfigUpdated(keccak256("ROUTER_ALLOWED"), router, 0, allowed);
     }
 
     function setAmmPair(address pair, address router, bool allowed) external onlyOwner onlyConfigurable {
@@ -364,10 +387,12 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         } else {
             pairRouter[pair] = address(0);
         }
+        emit ConfigUpdated(keccak256("AMM_PAIR"), pair, uint256(uint160(router)), allowed);
     }
 
     function setHopTokenAllowed(address token, bool allowed) external onlyOwner onlyConfigurable {
         hopTokenAllowed[token] = allowed;
+        emit ConfigUpdated(keccak256("HOP_TOKEN_ALLOWED"), token, 0, allowed);
     }
 
     function setPath(address router, address tokenIn, address tokenOut, address[] calldata path)
@@ -404,12 +429,15 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         for (uint256 i = 0; i < path.length; i++) {
             _path[key].push(path[i]);
         }
+        emit ConfigUpdated(key, router, path.length, true);
     }
 
     function setSwapSettings(uint256 threshold, uint256 maxSwap) external onlyOwner onlyConfigurable {
         _enforceSwapLimits(threshold, maxSwap);
         swapThreshold = threshold;
         maxSwapAmount = maxSwap;
+        emit ConfigUpdated(keccak256("SWAP_SETTINGS"), address(0), threshold, true);
+        emit ConfigUpdated(keccak256("SWAP_SETTINGS_MAX"), address(0), maxSwap, true);
     }
 
     function setSlippageBps(uint16 newSlippage) external onlyOwner onlyConfigurable {
@@ -417,6 +445,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             revert SlippageTooHigh();
         }
         slippageBps = newSlippage;
+        emit ConfigUpdated(keccak256("SLIPPAGE_BPS"), address(0), newSlippage, true);
     }
 
     function setBuybackSettings(uint256 cooldownSeconds, uint256 maxPerCall, uint256 upperLimit)
@@ -428,6 +457,9 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         buybackCooldownSeconds = cooldownSeconds;
         maxBuybackAnkr = maxPerCall;
         buybackUpperLimitAnkr = upperLimit;
+        emit ConfigUpdated(keccak256("BUYBACK_COOLDOWN"), address(0), cooldownSeconds, true);
+        emit ConfigUpdated(keccak256("BUYBACK_MAX"), address(0), maxPerCall, true);
+        emit ConfigUpdated(keccak256("BUYBACK_UPPER"), address(0), upperLimit, true);
     }
 
     function setMaxBuybackPriceImpactBps(uint16 newImpactBps) external onlyOwner onlyConfigurable {
@@ -435,6 +467,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             revert ImpactTooHigh();
         }
         maxBuybackPriceImpactBps = newImpactBps;
+        emit ConfigUpdated(keccak256("BUYBACK_IMPACT_BPS"), address(0), newImpactBps, true);
     }
 
     function setSwapEnabled(bool enabled) external onlyOwner {
@@ -453,6 +486,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         } else {
             swapEnabled = false;
         }
+        emit ConfigUpdated(keccak256("SWAP_ENABLED"), address(0), 0, enabled);
     }
 
     function setBuybackRouter(address router) external onlyOwner onlyConfigurable {
@@ -460,6 +494,50 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             revert RouterNotAllowed();
         }
         buybackRouter = router;
+        emit ConfigUpdated(keccak256("BUYBACK_ROUTER"), router, 0, true);
+    }
+
+    function setBuybackKeeper(address keeper) external onlyOwner {
+        if (keeper == address(0)) {
+            revert ZeroAddress();
+        }
+        buybackKeeper = keeper;
+        emit ConfigUpdated(keccak256("BUYBACK_KEEPER"), keeper, 0, true);
+    }
+
+    function setFeeExempt(address account, bool exempt) external onlyOwner {
+        if (account == address(0)) {
+            revert ZeroAddress();
+        }
+        if (configFinalized && exempt) {
+            revert ConfigFinalizedError();
+        }
+        isFeeExempt[account] = exempt;
+        emit ConfigUpdated(keccak256("FEE_EXEMPT"), account, 0, exempt);
+    }
+
+    function setRecoverAnkrEnabled(bool enabled) external onlyOwner {
+        if (!configFinalized) {
+            revert ConfigFinalizedError();
+        }
+        recoverAnkrEnabled = enabled;
+        emit ConfigUpdated(keccak256("RECOVER_ANKR"), address(0), 0, enabled);
+    }
+
+    function recoverERC20(address token, address to, uint256 amount) external onlyOwner {
+        if (token == address(0) || to == address(0)) {
+            revert ZeroAddress();
+        }
+        if (token == address(this)) {
+            revert RecoverNotAllowed();
+        }
+        if (token == ANKRBNB) {
+            if (!recoverAnkrEnabled || amount > maxBuybackAnkr) {
+                revert RecoverNotAllowed();
+            }
+        }
+        IERC20(token).safeTransfer(to, amount);
+        emit RecoveredERC20(token, to, amount);
     }
 
     function _approve(address owner_, address spender, uint256 amount) internal {
@@ -475,10 +553,12 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             revert ZeroAddress();
         }
         if (amount == 0) {
-            revert AmountZero();
+            emit Transfer(from, to, 0);
+            return;
         }
 
-        bool takeFee = (ammPairs[from] || ammPairs[to]) && to != DEAD;
+        bool takeFee =
+            !_inSwap && !isFeeExempt[from] && !isFeeExempt[to] && (ammPairs[from] || ammPairs[to]) && to != DEAD;
 
         if (takeFee) {
             _tokenTransferWithFee(from, to, amount);
@@ -577,17 +657,14 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             if (liquidityTarget > remaining) {
                 liquidityTarget = remaining;
             }
-            uint256 beforeBalance = balanceOf(address(this));
-            _processLiquidity(router, liquidityTarget);
-            uint256 afterBalance = balanceOf(address(this));
-            uint256 spent = beforeBalance > afterBalance ? beforeBalance - afterBalance : 0;
-            if (spent > liquidityTarget) {
-                spent = liquidityTarget;
-            }
-            if (spent > remaining) {
-                spent = remaining;
-            }
+            uint256 spent = _processLiquidity(router, liquidityTarget);
             if (spent > 0) {
+                if (spent > tokensForLiquidity) {
+                    spent = tokensForLiquidity;
+                }
+                if (spent > remaining) {
+                    spent = remaining;
+                }
                 tokensForLiquidity -= spent;
                 remaining -= spent;
             }
@@ -598,17 +675,14 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             if (buybackTarget > remaining) {
                 buybackTarget = remaining;
             }
-            uint256 beforeBalance = balanceOf(address(this));
-            _processBuybackSwap(router, buybackTarget);
-            uint256 afterBalance = balanceOf(address(this));
-            uint256 spent = beforeBalance > afterBalance ? beforeBalance - afterBalance : 0;
-            if (spent > buybackTarget) {
-                spent = buybackTarget;
-            }
-            if (spent > remaining) {
-                spent = remaining;
-            }
+            uint256 spent = _processBuybackSwap(router, buybackTarget);
             if (spent > 0) {
+                if (spent > tokensForBuyback) {
+                    spent = tokensForBuyback;
+                }
+                if (spent > remaining) {
+                    spent = remaining;
+                }
                 tokensForBuyback -= spent;
                 remaining -= spent;
             }
@@ -619,25 +693,29 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         emit SwapBack(swapAmount);
     }
 
-    function _processLiquidity(address router, uint256 amount) internal {
+    function _processLiquidity(address router, uint256 amount) internal returns (uint256) {
         if (amount == 0) {
-            return;
+            return 0;
         }
         uint256 half = amount / 2;
         uint256 otherHalf = amount - half;
         if (half == 0 || otherHalf == 0) {
-            return;
+            return 0;
         }
         uint256 beforeBalance = IERC20(ANKRBNB).balanceOf(address(this));
         if (!_swapTokensForAnkr(router, otherHalf)) {
-            return;
+            return 0;
         }
         uint256 afterBalance = IERC20(ANKRBNB).balanceOf(address(this));
         uint256 ankrOut = afterBalance - beforeBalance;
         if (ankrOut == 0) {
-            return;
+            return otherHalf;
         }
-        _addLiquidity(router, half, ankrOut);
+        bool added = _addLiquidity(router, half, ankrOut);
+        if (added) {
+            return amount;
+        }
+        return otherHalf;
     }
 
     function _swapTokensForAnkr(address router, uint256 amount) internal returns (bool) {
@@ -677,16 +755,22 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
     }
 
-    function _processBuybackSwap(address router, uint256 tokenAmount) internal {
+    function _processBuybackSwap(address router, uint256 tokenAmount) internal returns (uint256) {
         if (tokenAmount == 0) {
-            return;
+            return 0;
         }
         if (!_swapTokensForAnkr(router, tokenAmount)) {
-            return;
+            return 0;
         }
+        return tokenAmount;
     }
 
-    function buyback(uint256 ankrAmountIn, uint256 minOut, uint256 deadline) external nonReentrant returns (bool) {
+    function buyback(uint256 ankrAmountIn, uint256 minOut, uint256 deadline)
+        external
+        nonReentrant
+        onlyKeeperOrOwner
+        returns (bool)
+    {
         if (!swapEnabled || !configFinalized) {
             return false;
         }
@@ -773,17 +857,29 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
         (uint112 reserve0, uint112 reserve1,) = _safeGetReserves(pair);
         uint256 reserveIn;
+        uint256 reserveOut;
         if (tokenIn == token0) {
             reserveIn = reserve0;
+            reserveOut = reserve1;
         } else if (tokenIn == token1) {
             reserveIn = reserve1;
+            reserveOut = reserve0;
         } else {
             return BPS_DENOM;
         }
-        if (reserveIn == 0) {
+        if (reserveIn == 0 || reserveOut == 0) {
             return BPS_DENOM;
         }
-        return (amountIn * BPS_DENOM) / (reserveIn + amountIn);
+        uint256 spotOut = (amountIn * reserveOut) / reserveIn;
+        if (spotOut == 0) {
+            return BPS_DENOM;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 amountOut = (amountInWithFee * reserveOut) / (reserveIn * 1000 + amountInWithFee);
+        if (amountOut >= spotOut) {
+            return 0;
+        }
+        return ((spotOut - amountOut) * BPS_DENOM) / spotOut;
     }
 
     function _safeGetReserves(address pair) internal view returns (uint112, uint112, uint32) {

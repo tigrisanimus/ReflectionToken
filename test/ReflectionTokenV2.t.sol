@@ -52,6 +52,7 @@ contract ReflectionTokenV2Test is Test {
     bytes4 private constant NOT_OWNER = bytes4(keccak256("NotOwner()"));
     bytes4 private constant SLIPPAGE_TOO_HIGH = bytes4(keccak256("SlippageTooHigh()"));
     bytes4 private constant SWAP_NOT_FINALIZED = bytes4(keccak256("SwapNotFinalized()"));
+    bytes4 private constant NOT_KEEPER = bytes4(keccak256("NotKeeper()"));
 
     ReflectionTokenV2 private token;
     MockFactory private factory;
@@ -119,6 +120,18 @@ contract ReflectionTokenV2Test is Test {
         assertEq(token.tokensForBuyback(), 0);
     }
 
+    function testZeroTransfersAreAllowed() public {
+        uint256 ownerBalance = token.balanceOf(address(this));
+        token.transfer(alice, 0);
+        assertEq(token.balanceOf(address(this)), ownerBalance);
+        assertEq(token.balanceOf(alice), 0);
+
+        token.approve(address(this), 0);
+        token.transferFrom(address(this), bob, 0);
+        assertEq(token.balanceOf(bob), 0);
+        assertEq(token.balanceOf(address(this)), ownerBalance);
+    }
+
     function testBuyAppliesFeesAndSplits() public {
         uint256 amount = 10_000e18;
         uint256 expectedFee = (amount * 100) / 10_000;
@@ -183,6 +196,21 @@ contract ReflectionTokenV2Test is Test {
         assertEq(router.lastAddLiquidityTo(), token.DEAD());
         assertGt(ankrBnb.balanceOf(address(token)), 0);
         assertEq(token.balanceOf(token.DEAD()), 0);
+    }
+
+    function testSwapBackDoesNotSelfTax() public {
+        router.setQuotedAmountOut(10e18);
+        router.setPairRecipient(address(pair));
+        token.setSwapSettings(1e18, 10_000e18);
+        _finalizeAndEnableSwaps();
+
+        token.transfer(alice, 10_000e18);
+
+        vm.prank(alice);
+        token.transfer(address(pair), 10_000e18);
+
+        assertEq(token.tokensForLiquidity(), 0);
+        assertEq(token.tokensForBuyback(), 0);
     }
 
     function testMultiHopPathUsage() public {
@@ -439,6 +467,9 @@ contract ReflectionTokenV2Test is Test {
 
         vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setMaxBuybackPriceImpactBps(300);
+
+        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
+        token.setFeeExempt(alice, true);
     }
 
     function testFinalizeConfigAllowsSwapDisableOnly() public {
@@ -551,6 +582,27 @@ contract ReflectionTokenV2Test is Test {
         assertTrue(success);
         assertEq(router.lastAmountOutMin(), 9.9e18);
         assertGt(token.balanceOf(token.DEAD()), 0);
+    }
+
+    function testBuybackRequiresKeeper() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18);
+        token.setBuybackSettings(0, 2e18, 0);
+        _finalizeAndEnableSwaps();
+        token.setBuybackKeeper(alice);
+
+        token.transfer(bob, 21_000e18);
+        vm.prank(bob);
+        token.transfer(address(pair), 20_000e18);
+
+        vm.warp(1000);
+        vm.expectRevert(abi.encodeWithSelector(NOT_KEEPER));
+        vm.prank(bob);
+        token.buyback(1e18, 1, block.timestamp + 100);
+
+        vm.prank(alice);
+        bool success = token.buyback(1e18, 1, block.timestamp + 100);
+        assertTrue(success);
     }
 
     function testBuybackSwapFailureDoesNotAffectTransfers() public {
