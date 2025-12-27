@@ -76,11 +76,13 @@ error UpperLimitBelowMax();
 error ImpactTooHigh();
 error SwapNotFinalized();
 error SwapAlreadyEnabled();
-error SwapEnableLocked();
+error SwapEnabled();
 error Reentrancy();
 error FeeCapExceeded();
 error NotKeeper();
 error RecoverNotAllowed();
+error InvalidConfig();
+error PairRouterNotSet();
 
 library SafeERC20 {
     error SafeERC20Failed();
@@ -188,12 +190,13 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     mapping(address => bool) public factoryAllowed;
     mapping(address => address) public pairRouter;
     mapping(address => bool) public isFeeExempt;
+    address[] public ammPairList;
+    mapping(address => bool) private _ammPairListed;
 
     mapping(address => bool) public hopTokenAllowed;
     mapping(bytes32 => address[]) private _path;
 
     bool public swapEnabled;
-    bool private _swapEnabledOnce;
     uint256 public swapThreshold;
     uint256 public maxSwapAmount;
     uint16 public slippageBps = 100;
@@ -229,10 +232,28 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     uint256 public constant MAX_BUYBACK_ANKR = 100e18;
     uint16 public constant MAX_BUYBACK_PRICE_IMPACT_BPS = 500;
 
+    bytes32 private constant BUYBACK_FAIL_COOLDOWN = keccak256("COOLDOWN");
+    bytes32 private constant BUYBACK_FAIL_DISABLED = keccak256("DISABLED");
+    bytes32 private constant BUYBACK_FAIL_AMOUNT_ZERO = keccak256("AMOUNT_ZERO");
+    bytes32 private constant BUYBACK_FAIL_AMOUNT_TOO_HIGH = keccak256("AMOUNT_TOO_HIGH");
+    bytes32 private constant BUYBACK_FAIL_PAIR_NOT_SET = keccak256("PAIR_NOT_SET");
+    bytes32 private constant BUYBACK_FAIL_IMPACT_TOO_HIGH = keccak256("IMPACT_TOO_HIGH");
+    bytes32 private constant BUYBACK_FAIL_QUOTE_FAIL = keccak256("QUOTE_FAIL");
+    bytes32 private constant BUYBACK_FAIL_SWAP_FAIL = keccak256("SWAP_FAIL");
+    bytes32 private constant BUYBACK_FAIL_DEADLINE = keccak256("DEADLINE");
+
+    bytes32 private constant SWAP_BACK_SWAP = keccak256("SWAP_TOKENS_FOR_ANKR");
+    bytes32 private constant SWAP_BACK_ADD_LIQUIDITY = keccak256("ADD_LIQUIDITY");
+
     event SwapBack(uint256 tokensSwapped);
+    event SwapBackFailed(bytes32 step, uint256 tokenAmount, uint256 ankrAmount);
     event Buyback(address indexed router, uint256 amountIn);
+    event BuybackFailed(bytes32 reason, uint256 amountIn, uint256 minOut, uint256 extra);
+    event BuybackOverrideUsed(address indexed router, uint256 amountIn);
     event ConfigFinalized();
     event ConfigUpdated(bytes32 indexed key, address indexed target, uint256 value, bool flag);
+    event SwapEnabledUpdated(bool enabled);
+    event AmmPairUpdated(address indexed pair, address indexed router, bool isPair);
     event RecoveredERC20(address indexed token, address indexed to, uint256 amount);
 
     constructor(address ankrBnb_) {
@@ -292,6 +313,13 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         _;
     }
 
+    modifier swapsDisabled() {
+        if (swapEnabled) {
+            revert SwapEnabled();
+        }
+        _;
+    }
+
     function totalSupply() external view override returns (uint256) {
         return _tTotal;
     }
@@ -336,17 +364,24 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return _getRate();
     }
 
+    function validateConfig() external view returns (bool) {
+        return _validateConfig();
+    }
+
     function finalizeConfig() external onlyOwner onlyConfigurable {
+        if (!_validateConfig()) {
+            revert InvalidConfig();
+        }
         configFinalized = true;
         emit ConfigFinalized();
     }
 
-    function setFactoryAllowed(address factory, bool allowed) external onlyOwner onlyConfigurable {
+    function setFactoryAllowed(address factory, bool allowed) external onlyOwner swapsDisabled {
         factoryAllowed[factory] = allowed;
         emit ConfigUpdated(keccak256("FACTORY_ALLOWED"), factory, 0, allowed);
     }
 
-    function setRouterAllowed(address router, bool allowed) external onlyOwner onlyConfigurable {
+    function setRouterAllowed(address router, bool allowed) external onlyOwner swapsDisabled {
         if (allowed) {
             if (router.code.length == 0) {
                 revert RouterNotContract();
@@ -359,7 +394,30 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         emit ConfigUpdated(keccak256("ROUTER_ALLOWED"), router, 0, allowed);
     }
 
-    function setAmmPair(address pair, address router, bool allowed) external onlyOwner onlyConfigurable {
+    function setPairRouter(address pair, address router) external onlyOwner swapsDisabled {
+        if (pair.code.length == 0) {
+            revert PairNotContract();
+        }
+        if (router == address(0)) {
+            revert ZeroAddress();
+        }
+        if (!routerAllowed[router]) {
+            revert RouterNotAllowed();
+        }
+        address factory;
+        try IUniswapV2PairMinimal(pair).factory() returns (address factoryAddress) {
+            factory = factoryAddress;
+        } catch {
+            factory = address(0);
+        }
+        if (factory != address(0) && !factoryAllowed[factory]) {
+            revert FactoryNotAllowed();
+        }
+        pairRouter[pair] = router;
+        emit ConfigUpdated(keccak256("PAIR_ROUTER"), pair, uint256(uint160(router)), true);
+    }
+
+    function setAmmPair(address pair, bool allowed) external onlyOwner swapsDisabled {
         if (allowed) {
             if (pair.code.length == 0) {
                 revert PairNotContract();
@@ -376,6 +434,10 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             if (IUniswapV2FactoryMinimal(factory).getPair(token0, token1) != pair) {
                 revert PairNotInFactory();
             }
+            address router = pairRouter[pair];
+            if (router == address(0)) {
+                revert PairRouterNotSet();
+            }
             if (!routerAllowed[router]) {
                 revert RouterNotAllowed();
             }
@@ -383,14 +445,16 @@ contract ReflectionTokenV2 is IERC20, Ownable {
 
         ammPairs[pair] = allowed;
         if (allowed) {
-            pairRouter[pair] = router;
-        } else {
-            pairRouter[pair] = address(0);
+            if (!_ammPairListed[pair]) {
+                _ammPairListed[pair] = true;
+                ammPairList.push(pair);
+            }
         }
-        emit ConfigUpdated(keccak256("AMM_PAIR"), pair, uint256(uint160(router)), allowed);
+        emit ConfigUpdated(keccak256("AMM_PAIR"), pair, uint256(uint160(pairRouter[pair])), allowed);
+        emit AmmPairUpdated(pair, pairRouter[pair], allowed);
     }
 
-    function setHopTokenAllowed(address token, bool allowed) external onlyOwner onlyConfigurable {
+    function setHopTokenAllowed(address token, bool allowed) external onlyOwner swapsDisabled {
         hopTokenAllowed[token] = allowed;
         emit ConfigUpdated(keccak256("HOP_TOKEN_ALLOWED"), token, 0, allowed);
     }
@@ -398,7 +462,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
     function setPath(address router, address tokenIn, address tokenOut, address[] calldata path)
         external
         onlyOwner
-        onlyConfigurable
+        swapsDisabled
     {
         if (!routerAllowed[router]) {
             revert RouterNotAllowed();
@@ -411,6 +475,12 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
         if (path[path.length - 1] != tokenOut) {
             revert BadPathEnd();
+        }
+        if (tokenIn == address(this) && tokenOut != ANKRBNB) {
+            revert BadPathEnd();
+        }
+        if (tokenOut == address(this) && tokenIn != ANKRBNB) {
+            revert BadPathStart();
         }
         for (uint256 i = 0; i < path.length; i++) {
             address hop = path[i];
@@ -475,21 +545,21 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             if (!configFinalized) {
                 revert SwapNotFinalized();
             }
+            if (!_validateConfig()) {
+                revert InvalidConfig();
+            }
             if (swapEnabled) {
                 revert SwapAlreadyEnabled();
             }
-            if (_swapEnabledOnce) {
-                revert SwapEnableLocked();
-            }
             swapEnabled = true;
-            _swapEnabledOnce = true;
         } else {
             swapEnabled = false;
         }
         emit ConfigUpdated(keccak256("SWAP_ENABLED"), address(0), 0, enabled);
+        emit SwapEnabledUpdated(enabled);
     }
 
-    function setBuybackRouter(address router) external onlyOwner onlyConfigurable {
+    function setBuybackRouter(address router) external onlyOwner swapsDisabled {
         if (!routerAllowed[router]) {
             revert RouterNotAllowed();
         }
@@ -538,6 +608,46 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         }
         IERC20(token).safeTransfer(to, amount);
         emit RecoveredERC20(token, to, amount);
+    }
+
+    function _validateConfig() internal view returns (bool) {
+        if (ANKRBNB == address(0)) {
+            return false;
+        }
+        if (buybackRouter == address(0) || !routerAllowed[buybackRouter]) {
+            return false;
+        }
+        if (!_hasValidStoredPath(buybackRouter, ANKRBNB, address(this))) {
+            return false;
+        }
+        bool hasActivePair;
+        for (uint256 i = 0; i < ammPairList.length; i++) {
+            address pair = ammPairList[i];
+            if (!ammPairs[pair]) {
+                continue;
+            }
+            hasActivePair = true;
+            address router = pairRouter[pair];
+            if (router == address(0) || !routerAllowed[router]) {
+                return false;
+            }
+            if (!_hasValidStoredPath(router, address(this), ANKRBNB)) {
+                return false;
+            }
+            address factory;
+            try IUniswapV2PairMinimal(pair).factory() returns (address factoryAddress) {
+                factory = factoryAddress;
+            } catch {
+                factory = address(0);
+            }
+            if (factory != address(0) && !factoryAllowed[factory]) {
+                return false;
+            }
+        }
+        if (!hasActivePair) {
+            return false;
+        }
+        return true;
     }
 
     function _approve(address owner_, address spender, uint256 amount) internal {
@@ -620,6 +730,23 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return rSupply / tSupply;
     }
 
+    function _syncFeeTokensToBuckets() internal {
+        uint256 contractBal = balanceOf(address(this));
+        uint256 bucketSum = tokensForLiquidity + tokensForBuyback;
+        if (contractBal <= bucketSum) {
+            return;
+        }
+        uint256 excess = contractBal - bucketSum;
+        if (bucketSum == 0) {
+            tokensForBuyback += excess;
+            return;
+        }
+        uint256 addL = (excess * tokensForLiquidity) / bucketSum;
+        uint256 addB = excess - addL;
+        tokensForLiquidity += addL;
+        tokensForBuyback += addB;
+    }
+
     function _swapBack(address router) internal {
         if (_inSwap) {
             return;
@@ -630,6 +757,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         if (router == address(0) || !routerAllowed[router]) {
             return;
         }
+        _syncFeeTokensToBuckets();
         uint256 totalTokensToSwap = tokensForLiquidity + tokensForBuyback;
         if (totalTokensToSwap == 0) {
             return;
@@ -725,6 +853,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         address[] memory path = _getPath(router, address(this), ANKRBNB);
         uint256 amountOutMin = _quoteAmountOutMin(router, amount, path);
         if (amountOutMin == 0) {
+            emit SwapBackFailed(SWAP_BACK_SWAP, amount, 0);
             return false;
         }
         IERC20(address(this)).forceApprove(router, amount);
@@ -734,6 +863,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             ) {
             return true;
         } catch {
+            emit SwapBackFailed(SWAP_BACK_SWAP, amount, amountOutMin);
             return false;
         }
     }
@@ -751,6 +881,7 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         ) {
             return true;
         } catch {
+            emit SwapBackFailed(SWAP_BACK_ADD_LIQUIDITY, tokenAmount, ankrAmount);
             return false;
         }
     }
@@ -772,21 +903,21 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         returns (bool)
     {
         if (!swapEnabled || !configFinalized) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_DISABLED, 0, minOut, 0);
         }
         if (deadline < block.timestamp) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_DEADLINE, 0, minOut, deadline);
         }
         if (block.timestamp < lastBuybackTimestamp + buybackCooldownSeconds) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_COOLDOWN, 0, minOut, lastBuybackTimestamp);
         }
         address router = buybackRouter;
         if (router == address(0) || !routerAllowed[router]) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_DISABLED, 0, minOut, 0);
         }
         uint256 ankrBalance = IERC20(ANKRBNB).balanceOf(address(this));
         if (ankrBalance == 0) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_ZERO, 0, minOut, 0);
         }
         uint256 amountIn = ankrAmountIn == 0 ? ankrBalance : ankrAmountIn;
         if (amountIn > ankrBalance) {
@@ -799,31 +930,31 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             amountIn = maxBuybackAnkr;
         }
         if (amountIn == 0) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_ZERO, 0, minOut, 0);
         }
         address factory;
         try IUniswapV2RouterMinimal(router).factory() returns (address factoryAddress) {
             factory = factoryAddress;
         } catch {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
         }
         address pair;
         try IUniswapV2FactoryMinimal(factory).getPair(ANKRBNB, address(this)) returns (address pairAddress) {
             pair = pairAddress;
         } catch {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
         }
         if (pair == address(0) || pair.code.length == 0) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
         }
         uint256 impactBps = _estimatePriceImpactBps(pair, ANKRBNB, amountIn);
         if (impactBps > maxBuybackPriceImpactBps) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_IMPACT_TOO_HIGH, amountIn, minOut, impactBps);
         }
         address[] memory path = _getPath(router, ANKRBNB, address(this));
         uint256 amountOutMin = _quoteAmountOutMin(router, amountIn, path);
         if (amountOutMin == 0) {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_QUOTE_FAIL, amountIn, minOut, 0);
         }
         if (minOut > amountOutMin) {
             amountOutMin = minOut;
@@ -835,7 +966,68 @@ contract ReflectionTokenV2 is IERC20, Ownable {
             emit Buyback(router, amountIn);
             return true;
         } catch {
-            return false;
+            return _emitBuybackFailed(BUYBACK_FAIL_SWAP_FAIL, amountIn, amountOutMin, 0);
+        }
+    }
+
+    function buybackOverride(uint256 amountIn, uint256 minOut) external nonReentrant onlyOwner returns (bool) {
+        if (!swapEnabled || !configFinalized) {
+            return _emitBuybackFailed(BUYBACK_FAIL_DISABLED, amountIn, minOut, 0);
+        }
+        if (block.timestamp < lastBuybackTimestamp + buybackCooldownSeconds) {
+            return _emitBuybackFailed(BUYBACK_FAIL_COOLDOWN, amountIn, minOut, lastBuybackTimestamp);
+        }
+        if (amountIn == 0) {
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_ZERO, amountIn, minOut, 0);
+        }
+        if (maxBuybackAnkr > 0 && amountIn > maxBuybackAnkr) {
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_TOO_HIGH, amountIn, minOut, maxBuybackAnkr);
+        }
+        if (buybackUpperLimitAnkr > 0 && amountIn > buybackUpperLimitAnkr) {
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_TOO_HIGH, amountIn, minOut, buybackUpperLimitAnkr);
+        }
+        address router = buybackRouter;
+        if (router == address(0) || !routerAllowed[router]) {
+            return _emitBuybackFailed(BUYBACK_FAIL_DISABLED, amountIn, minOut, 0);
+        }
+        uint256 ankrBalance = IERC20(ANKRBNB).balanceOf(address(this));
+        if (ankrBalance < amountIn) {
+            return _emitBuybackFailed(BUYBACK_FAIL_AMOUNT_TOO_HIGH, amountIn, minOut, ankrBalance);
+        }
+        address factory;
+        try IUniswapV2RouterMinimal(router).factory() returns (address factoryAddress) {
+            factory = factoryAddress;
+        } catch {
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
+        }
+        address pair;
+        try IUniswapV2FactoryMinimal(factory).getPair(ANKRBNB, address(this)) returns (address pairAddress) {
+            pair = pairAddress;
+        } catch {
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
+        }
+        if (pair == address(0) || pair.code.length == 0) {
+            return _emitBuybackFailed(BUYBACK_FAIL_PAIR_NOT_SET, amountIn, minOut, 0);
+        }
+        address[] memory path = _getPath(router, ANKRBNB, address(this));
+        uint256 amountOutMin = _quoteAmountOutMin(router, amountIn, path);
+        if (amountOutMin == 0) {
+            return _emitBuybackFailed(BUYBACK_FAIL_QUOTE_FAIL, amountIn, minOut, 0);
+        }
+        if (minOut > amountOutMin) {
+            amountOutMin = minOut;
+        }
+        IERC20(ANKRBNB).forceApprove(router, amountIn);
+        try IUniswapV2RouterMinimal(router)
+            .swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                amountIn, amountOutMin, path, DEAD, block.timestamp
+            ) {
+            lastBuybackTimestamp = block.timestamp;
+            emit Buyback(router, amountIn);
+            emit BuybackOverrideUsed(router, amountIn);
+            return true;
+        } catch {
+            return _emitBuybackFailed(BUYBACK_FAIL_SWAP_FAIL, amountIn, amountOutMin, 0);
         }
     }
 
@@ -915,6 +1107,23 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         return minOut;
     }
 
+    function _hasValidStoredPath(address router, address tokenIn, address tokenOut) internal view returns (bool) {
+        bytes32 key = _pathKey(router, tokenIn, tokenOut);
+        address[] storage stored = _path[key];
+        if (stored.length < 2) {
+            return false;
+        }
+        if (stored[0] != tokenIn || stored[stored.length - 1] != tokenOut) {
+            return false;
+        }
+        for (uint256 i = 0; i < stored.length; i++) {
+            if (stored[i] == address(0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     function _pathKey(address router, address tokenIn, address tokenOut) internal pure returns (bytes32) {
         return keccak256(abi.encode(router, tokenIn, tokenOut));
     }
@@ -941,6 +1150,14 @@ contract ReflectionTokenV2 is IERC20, Ownable {
         if (tSupply == 0 || rSupply == 0 || rSupply < tSupply) {
             return (_rTotal, _tTotal);
         }
+    }
+
+    function _emitBuybackFailed(bytes32 reason, uint256 amountIn, uint256 minOut, uint256 extra)
+        internal
+        returns (bool)
+    {
+        emit BuybackFailed(reason, amountIn, minOut, extra);
+        return false;
     }
 
     function _enforceFeeCap() internal pure {

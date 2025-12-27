@@ -44,15 +44,23 @@ contract RevertingPair {
 
 contract ReflectionTokenV2Test is Test {
     event Transfer(address indexed from, address indexed to, uint256 value);
+    event BuybackFailed(bytes32 reason, uint256 amountIn, uint256 minOut, uint256 extra);
+    event BuybackOverrideUsed(address indexed router, uint256 amountIn);
+    event SwapBackFailed(bytes32 step, uint256 tokenAmount, uint256 ankrAmount);
 
     bytes4 private constant CONFIG_FINALIZED = bytes4(keccak256("ConfigFinalizedError()"));
     bytes4 private constant PAIR_NOT_IN_FACTORY = bytes4(keccak256("PairNotInFactory()"));
     bytes4 private constant ZERO_ADDRESS_IN_PATH = bytes4(keccak256("ZeroAddressInPath()"));
-    bytes4 private constant SWAP_ENABLE_LOCKED = bytes4(keccak256("SwapEnableLocked()"));
     bytes4 private constant NOT_OWNER = bytes4(keccak256("NotOwner()"));
     bytes4 private constant SLIPPAGE_TOO_HIGH = bytes4(keccak256("SlippageTooHigh()"));
     bytes4 private constant SWAP_NOT_FINALIZED = bytes4(keccak256("SwapNotFinalized()"));
     bytes4 private constant NOT_KEEPER = bytes4(keccak256("NotKeeper()"));
+    bytes4 private constant INVALID_CONFIG = bytes4(keccak256("InvalidConfig()"));
+    bytes4 private constant ROUTER_NOT_ALLOWED = bytes4(keccak256("RouterNotAllowed()"));
+    bytes4 private constant SWAP_ENABLED = bytes4(keccak256("SwapEnabled()"));
+    bytes4 private constant PAIR_ROUTER_NOT_SET = bytes4(keccak256("PairRouterNotSet()"));
+    bytes32 private constant BUYBACK_FAILED_SIG = keccak256("BuybackFailed(bytes32,uint256,uint256,uint256)");
+    bytes32 private constant SWAP_BACK_FAILED_SIG = keccak256("SwapBackFailed(bytes32,uint256,uint256)");
 
     ReflectionTokenV2 private token;
     MockFactory private factory;
@@ -99,7 +107,8 @@ contract ReflectionTokenV2Test is Test {
         pair.setReserves(1_000_000e18, 1_000_000e18);
 
         token.transfer(address(pair), 200_000e18);
-        token.setAmmPair(address(pair), address(router), true);
+        token.setPairRouter(address(pair), address(router));
+        token.setAmmPair(address(pair), true);
         token.transfer(address(router), 100_000e18);
     }
 
@@ -264,7 +273,8 @@ contract ReflectionTokenV2Test is Test {
         pathToToken[2] = address(token);
         token.setPath(address(failingRouter), address(ankrBnb), address(token), pathToToken);
 
-        token.setAmmPair(address(pair), address(failingRouter), true);
+        token.setPairRouter(address(pair), address(failingRouter));
+        token.setAmmPair(address(pair), true);
 
         failingRouter.setFailSwap(true);
         failingRouter.setFailAddLiquidity(true);
@@ -292,14 +302,15 @@ contract ReflectionTokenV2Test is Test {
     function testSetAmmPairRequiresFactoryPairMatch() public {
         MockPair spoofPair = new MockPair(address(token), address(ankrBnb), address(factory));
 
+        token.setPairRouter(address(spoofPair), address(router));
         vm.expectRevert(abi.encodeWithSelector(PAIR_NOT_IN_FACTORY));
-        token.setAmmPair(address(spoofPair), address(router), true);
+        token.setAmmPair(address(spoofPair), true);
     }
 
     function testSetAmmPairDisableSkipsPairCalls() public {
         RevertingPair badPair = new RevertingPair();
 
-        token.setAmmPair(address(badPair), address(router), false);
+        token.setAmmPair(address(badPair), false);
 
         assertFalse(token.ammPairs(address(badPair)));
         assertEq(token.pairRouter(address(badPair)), address(0));
@@ -324,11 +335,14 @@ contract ReflectionTokenV2Test is Test {
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, sellAmount);
 
+        vm.recordLogs();
         vm.prank(alice);
         token.transfer(address(pair), sellAmount);
 
-        assertEq(token.tokensForLiquidity(), 20e18);
-        assertEq(token.tokensForBuyback(), 20e18);
+        assertTrue(_hasSwapBackFailedStep(keccak256("ADD_LIQUIDITY")));
+        assertGe(token.tokensForLiquidity(), 20e18);
+        assertGe(token.tokensForBuyback(), 20e18);
+        assertApproxEqAbs(token.balanceOf(address(token)), token.tokensForLiquidity() + token.tokensForBuyback(), 1);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
@@ -341,12 +355,34 @@ contract ReflectionTokenV2Test is Test {
         uint256 sellAmount = 10_000e18;
         token.transfer(alice, sellAmount);
 
+        vm.recordLogs();
         vm.prank(alice);
         token.transfer(address(pair), sellAmount);
 
-        assertEq(token.tokensForLiquidity(), 40e18);
-        assertEq(token.tokensForBuyback(), 40e18);
+        assertTrue(_hasSwapBackFailedStep(keccak256("SWAP_TOKENS_FOR_ANKR")));
+        assertGe(token.tokensForLiquidity(), 40e18);
+        assertGe(token.tokensForBuyback(), 40e18);
+        assertApproxEqAbs(token.balanceOf(address(token)), token.tokensForLiquidity() + token.tokensForBuyback(), 1);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
+    }
+
+    function testSwapBackSyncsExcessReflections() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18);
+        _finalizeAndEnableSwaps();
+
+        vm.prank(address(pair));
+        token.transfer(alice, 10_000e18);
+
+        uint256 bucketSum = token.tokensForLiquidity() + token.tokensForBuyback();
+        uint256 contractBal = token.balanceOf(address(token));
+        assertGt(contractBal, bucketSum);
+
+        vm.prank(alice);
+        token.transfer(address(pair), 5_000e18);
+
+        uint256 postBucketSum = token.tokensForLiquidity() + token.tokensForBuyback();
+        assertApproxEqAbs(token.balanceOf(address(token)), postBucketSum, 1);
     }
 
     function testFeeCapEnforced() public {
@@ -401,8 +437,9 @@ contract ReflectionTokenV2Test is Test {
         token.transfer(address(pair), 5_000e18);
 
         assertEq(router.swapPathHashCount(), 0);
-        assertEq(token.tokensForLiquidity(), 20e18);
-        assertEq(token.tokensForBuyback(), 20e18);
+        assertGe(token.tokensForLiquidity(), 20e18);
+        assertGe(token.tokensForBuyback(), 20e18);
+        assertApproxEqAbs(token.balanceOf(address(token)), token.tokensForLiquidity() + token.tokensForBuyback(), 1);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
@@ -416,8 +453,9 @@ contract ReflectionTokenV2Test is Test {
         token.transfer(address(pair), 5_000e18);
 
         assertEq(router.swapPathHashCount(), 0);
-        assertEq(token.tokensForLiquidity(), 20e18);
-        assertEq(token.tokensForBuyback(), 20e18);
+        assertGe(token.tokensForLiquidity(), 20e18);
+        assertGe(token.tokensForBuyback(), 20e18);
+        assertApproxEqAbs(token.balanceOf(address(token)), token.tokensForLiquidity() + token.tokensForBuyback(), 1);
         assertGt(token.balanceOf(address(pair)), 200_000e18);
     }
 
@@ -438,22 +476,6 @@ contract ReflectionTokenV2Test is Test {
         token.finalizeConfig();
 
         vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
-        token.setFactoryAllowed(address(factory), false);
-
-        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
-        token.setRouterAllowed(address(router), false);
-
-        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
-        token.setAmmPair(address(pair), address(router), false);
-
-        address[] memory path = new address[](2);
-        path[0] = address(token);
-        path[1] = address(ankrBnb);
-
-        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
-        token.setPath(address(router), address(token), address(ankrBnb), path);
-
-        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setSwapSettings(2e18, 10_000e18);
 
         vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
@@ -461,9 +483,6 @@ contract ReflectionTokenV2Test is Test {
 
         vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setBuybackSettings(0, 1e18, 2e18);
-
-        vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
-        token.setHopTokenAllowed(address(wbnb), false);
 
         vm.expectRevert(abi.encodeWithSelector(CONFIG_FINALIZED));
         token.setMaxBuybackPriceImpactBps(300);
@@ -477,9 +496,288 @@ contract ReflectionTokenV2Test is Test {
         token.setSwapEnabled(true);
         token.setSwapEnabled(false);
         assertFalse(token.swapEnabled());
-
-        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLE_LOCKED));
         token.setSwapEnabled(true);
+        assertTrue(token.swapEnabled());
+    }
+
+    function testEnableSwapsRevalidatesConfig() public {
+        token.finalizeConfig();
+        token.setSwapEnabled(true);
+
+        token.setSwapEnabled(false);
+        token.setRouterAllowed(address(router), false);
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        token.setSwapEnabled(true);
+    }
+
+    function testFinalizeConfigRequiresBuybackRouter() public {
+        (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        ) = _deployTokenBase();
+
+        _setPathsForRouter(newToken, newRouter, newWbnb, newAnkr);
+
+        MockPair newPair = new MockPair(address(newToken), address(newAnkr), address(newFactory));
+        newFactory.setPair(address(newToken), address(newAnkr), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        newToken.setPairRouter(address(newPair), address(newRouter));
+        newToken.setAmmPair(address(newPair), true);
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        newToken.finalizeConfig();
+    }
+
+    function testFinalizeConfigRequiresBuybackRouterAllowed() public {
+        (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        ) = _deployTokenBase();
+
+        MockRouter buybackRouter = new MockRouter(address(newFactory));
+        newToken.setRouterAllowed(address(buybackRouter), true);
+        _setPathsForRouter(newToken, buybackRouter, newWbnb, newAnkr);
+        newToken.setBuybackRouter(address(buybackRouter));
+
+        _setPathsForRouter(newToken, newRouter, newWbnb, newAnkr);
+        MockPair newPair = new MockPair(address(newToken), address(newAnkr), address(newFactory));
+        newFactory.setPair(address(newToken), address(newAnkr), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        newToken.setPairRouter(address(newPair), address(newRouter));
+        newToken.setAmmPair(address(newPair), true);
+
+        newToken.setRouterAllowed(address(buybackRouter), false);
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        newToken.finalizeConfig();
+    }
+
+    function testFinalizeConfigRequiresAmmPair() public {
+        (ReflectionTokenV2 newToken,, MockRouter newRouter, MockERC20 newAnkr, MockERC20 newWbnb) = _deployTokenBase();
+
+        _setPathsForRouter(newToken, newRouter, newWbnb, newAnkr);
+        newToken.setBuybackRouter(address(newRouter));
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        newToken.finalizeConfig();
+    }
+
+    function testFinalizeConfigRequiresPairRouterAllowed() public {
+        (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        ) = _deployTokenBase();
+
+        MockRouter buybackRouter = new MockRouter(address(newFactory));
+        newToken.setRouterAllowed(address(buybackRouter), true);
+        _setPathsForRouter(newToken, buybackRouter, newWbnb, newAnkr);
+        newToken.setBuybackRouter(address(buybackRouter));
+
+        _setPathsForRouter(newToken, newRouter, newWbnb, newAnkr);
+        MockPair newPair = new MockPair(address(newToken), address(newAnkr), address(newFactory));
+        newFactory.setPair(address(newToken), address(newAnkr), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        newToken.setPairRouter(address(newPair), address(newRouter));
+        newToken.setAmmPair(address(newPair), true);
+
+        newToken.setRouterAllowed(address(newRouter), false);
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        newToken.finalizeConfig();
+    }
+
+    function testFinalizeConfigRequiresSwapPaths() public {
+        (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        ) = _deployTokenBase();
+
+        address[] memory pathToToken = _buildPath(address(newAnkr), address(newWbnb), address(newToken));
+        newToken.setPath(address(newRouter), address(newAnkr), address(newToken), pathToToken);
+        newToken.setBuybackRouter(address(newRouter));
+
+        MockPair newPair = new MockPair(address(newToken), address(newAnkr), address(newFactory));
+        newFactory.setPair(address(newToken), address(newAnkr), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        newToken.setPairRouter(address(newPair), address(newRouter));
+        newToken.setAmmPair(address(newPair), true);
+
+        vm.expectRevert(abi.encodeWithSelector(INVALID_CONFIG));
+        newToken.finalizeConfig();
+    }
+
+    function testFinalizeConfigSucceedsWithCompleteConfig() public {
+        (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        ) = _deployTokenBase();
+
+        _setPathsForRouter(newToken, newRouter, newWbnb, newAnkr);
+        newToken.setBuybackRouter(address(newRouter));
+
+        MockPair newPair = new MockPair(address(newToken), address(newAnkr), address(newFactory));
+        newFactory.setPair(address(newToken), address(newAnkr), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        newToken.setPairRouter(address(newPair), address(newRouter));
+        newToken.setAmmPair(address(newPair), true);
+
+        newToken.finalizeConfig();
+        assertTrue(newToken.configFinalized());
+    }
+
+    function testPostFinalizeAddAmmPairAppliesFees() public {
+        token.finalizeConfig();
+
+        MockRouter newRouter = new MockRouter(address(factory));
+        token.setRouterAllowed(address(newRouter), true);
+
+        address[] memory pathToAnkr = _buildPath(address(token), address(wbnb), address(ankrBnb));
+        token.setPath(address(newRouter), address(token), address(ankrBnb), pathToAnkr);
+        address[] memory pathToToken = _buildPath(address(ankrBnb), address(wbnb), address(token));
+        token.setPath(address(newRouter), address(ankrBnb), address(token), pathToToken);
+
+        MockPair newPair = new MockPair(address(token), address(ankrBnb), address(factory));
+        factory.setPair(address(token), address(ankrBnb), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+
+        token.setPairRouter(address(newPair), address(newRouter));
+        token.setAmmPair(address(newPair), true);
+
+        token.transfer(address(newPair), 50_000e18);
+        vm.prank(address(newPair));
+        token.transfer(alice, 10_000e18);
+
+        assertGt(token.tokensForLiquidity(), 0);
+        assertGt(token.tokensForBuyback(), 0);
+    }
+
+    function testPostFinalizeAmmPairRequiresRouter() public {
+        token.finalizeConfig();
+
+        MockPair newPair = new MockPair(address(token), address(ankrBnb), address(factory));
+        factory.setPair(address(token), address(ankrBnb), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+
+        vm.expectRevert(abi.encodeWithSelector(PAIR_ROUTER_NOT_SET));
+        token.setAmmPair(address(newPair), true);
+    }
+
+    function testPostFinalizeSetPathRequiresAllowedRouter() public {
+        token.finalizeConfig();
+
+        MockRouter newRouter = new MockRouter(address(factory));
+        address[] memory pathToAnkr = _buildPath(address(token), address(wbnb), address(ankrBnb));
+
+        vm.expectRevert(abi.encodeWithSelector(ROUTER_NOT_ALLOWED));
+        token.setPath(address(newRouter), address(token), address(ankrBnb), pathToAnkr);
+    }
+
+    function testRouterRemovalRequiresSwapsDisabled() public {
+        token.finalizeConfig();
+        token.setSwapEnabled(true);
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setRouterAllowed(address(router), false);
+
+        token.setSwapEnabled(false);
+        token.setRouterAllowed(address(router), false);
+        assertFalse(token.routerAllowed(address(router)));
+    }
+
+    function testSwapsDisabledGatesConfigChanges() public {
+        token.finalizeConfig();
+        token.setSwapEnabled(true);
+
+        address[] memory path = _buildPath(address(token), address(wbnb), address(ankrBnb));
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setFactoryAllowed(address(factory), false);
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setRouterAllowed(address(router), false);
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setPairRouter(address(pair), address(router));
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setPath(address(router), address(token), address(ankrBnb), path);
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setBuybackRouter(address(router));
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setHopTokenAllowed(address(wbnb), false);
+
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setAmmPair(address(pair), false);
+
+        MockPair newPair = new MockPair(address(token), address(ankrBnb), address(factory));
+        factory.setPair(address(token), address(ankrBnb), address(newPair));
+        newPair.setReserves(1_000_000e18, 1_000_000e18);
+        vm.expectRevert(abi.encodeWithSelector(SWAP_ENABLED));
+        token.setAmmPair(address(newPair), true);
+
+        token.setSwapEnabled(false);
+
+        token.setFactoryAllowed(address(factory), false);
+        token.setFactoryAllowed(address(factory), true);
+
+        token.setRouterAllowed(address(router), false);
+        token.setRouterAllowed(address(router), true);
+
+        token.setPairRouter(address(pair), address(router));
+        token.setPath(address(router), address(token), address(ankrBnb), path);
+        token.setBuybackRouter(address(router));
+        token.setHopTokenAllowed(address(wbnb), false);
+
+        token.setAmmPair(address(pair), false);
+        assertEq(token.pairRouter(address(pair)), address(router));
+
+        token.setPairRouter(address(newPair), address(router));
+        token.setAmmPair(address(newPair), true);
+        assertTrue(token.ammPairs(address(newPair)));
+    }
+
+    function testBuybackOverrideBypassesImpactCheck() public {
+        router.setQuotedAmountOut(10e18);
+        token.setSwapSettings(1e18, 10_000e18);
+        token.setBuybackSettings(0, 5e18, 0);
+        token.setMaxBuybackPriceImpactBps(50);
+        _finalizeAndEnableSwaps();
+
+        pair.setReserves(1e18, 1e18);
+
+        token.transfer(alice, 21_000e18);
+        vm.prank(alice);
+        token.transfer(address(pair), 20_000e18);
+
+        vm.recordLogs();
+        bool success = token.buyback(5e18, 1, block.timestamp + 100);
+        assertFalse(success);
+        assertTrue(_hasBuybackFailedReason(keccak256("IMPACT_TOO_HIGH")));
+
+        uint256 deadBefore = token.balanceOf(token.DEAD());
+        vm.recordLogs();
+        bool overrideSuccess = token.buybackOverride(5e18, 1);
+        assertTrue(overrideSuccess);
+        assertTrue(_hasBuybackOverrideUsed());
+        assertGt(token.balanceOf(token.DEAD()), deadBefore);
     }
 
     function testBuybackPriceImpactCapSkips() public {
@@ -498,8 +796,10 @@ contract ReflectionTokenV2Test is Test {
         bytes32 expectedBuybackPath = _hashPath(_buildPath(address(ankrBnb), address(wbnb), address(token)));
         assertEq(_countSwapPath(expectedBuybackPath), 0);
 
+        vm.recordLogs();
         bool success = token.buyback(5e18, 1, block.timestamp + 100);
         assertFalse(success);
+        assertTrue(_hasBuybackFailedReason(keccak256("IMPACT_TOO_HIGH")));
         assertEq(_countSwapPath(expectedBuybackPath), 0);
     }
 
@@ -625,6 +925,38 @@ contract ReflectionTokenV2Test is Test {
         assertEq(token.balanceOf(bob), 1_000e18);
     }
 
+    function _deployTokenBase()
+        private
+        returns (
+            ReflectionTokenV2 newToken,
+            MockFactory newFactory,
+            MockRouter newRouter,
+            MockERC20 newAnkr,
+            MockERC20 newWbnb
+        )
+    {
+        newFactory = new MockFactory();
+        newRouter = new MockRouter(address(newFactory));
+        newAnkr = new MockERC20("ankrBNB", "ankrBNB", 18);
+        newWbnb = new MockERC20("WBNB", "WBNB", 18);
+
+        newToken = new ReflectionTokenV2(address(newAnkr));
+        newToken.setFactoryAllowed(address(newFactory), true);
+        newToken.setRouterAllowed(address(newRouter), true);
+        newToken.setHopTokenAllowed(address(newAnkr), true);
+        newToken.setHopTokenAllowed(address(newWbnb), true);
+    }
+
+    function _setPathsForRouter(ReflectionTokenV2 newToken, MockRouter newRouter, MockERC20 newWbnb, MockERC20 newAnkr)
+        private
+    {
+        address[] memory pathToAnkr = _buildPath(address(newToken), address(newWbnb), address(newAnkr));
+        newToken.setPath(address(newRouter), address(newToken), address(newAnkr), pathToAnkr);
+
+        address[] memory pathToToken = _buildPath(address(newAnkr), address(newWbnb), address(newToken));
+        newToken.setPath(address(newRouter), address(newAnkr), address(newToken), pathToToken);
+    }
+
     function _buildPath(address a, address b, address c) private pure returns (address[] memory path) {
         path = new address[](3);
         path[0] = a;
@@ -648,5 +980,51 @@ contract ReflectionTokenV2Test is Test {
     function _finalizeAndEnableSwaps() private {
         token.finalizeConfig();
         token.setSwapEnabled(true);
+    }
+
+    function _hasBuybackFailedReason(bytes32 reason) private returns (bool) {
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].emitter != address(token)) {
+                continue;
+            }
+            if (entries[i].topics.length > 0 && entries[i].topics[0] == BUYBACK_FAILED_SIG) {
+                (bytes32 loggedReason,,,) = abi.decode(entries[i].data, (bytes32, uint256, uint256, uint256));
+                if (loggedReason == reason) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function _hasBuybackOverrideUsed() private returns (bool) {
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 sig = keccak256("BuybackOverrideUsed(address,uint256)");
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].emitter != address(token)) {
+                continue;
+            }
+            if (entries[i].topics.length > 0 && entries[i].topics[0] == sig) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _hasSwapBackFailedStep(bytes32 step) private returns (bool) {
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        for (uint256 i = 0; i < entries.length; i++) {
+            if (entries[i].emitter != address(token)) {
+                continue;
+            }
+            if (entries[i].topics.length > 0 && entries[i].topics[0] == SWAP_BACK_FAILED_SIG) {
+                (bytes32 loggedStep,,) = abi.decode(entries[i].data, (bytes32, uint256, uint256));
+                if (loggedStep == step) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }
