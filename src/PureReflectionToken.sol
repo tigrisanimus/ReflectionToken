@@ -34,6 +34,7 @@ contract PureReflectionToken is IERC20 {
     mapping(address => mapping(address => uint256)) private _allowances;
 
     error ZeroAddress();
+    error ZeroTotalSupply();
     error AllowanceExceeded();
 
     constructor(
@@ -44,6 +45,7 @@ contract PureReflectionToken is IERC20 {
         address initialHolder
     ) {
         if (initialHolder == address(0)) revert ZeroAddress();
+        if (totalSupplyTokens == 0) revert ZeroTotalSupply();
 
         name = name_;
         symbol = symbol_;
@@ -59,8 +61,12 @@ contract PureReflectionToken is IERC20 {
         uint256 rDead = tDead * rate;
         uint256 rHolder = _rTotal - rDead;
 
-        _rOwned[DEAD] = rDead;
-        _rOwned[initialHolder] = rHolder;
+        if (initialHolder == DEAD) {
+            _rOwned[DEAD] = rDead + rHolder;
+        } else {
+            _rOwned[DEAD] = rDead;
+            _rOwned[initialHolder] = rHolder;
+        }
 
         emit Transfer(address(0), DEAD, tDead);
         emit Transfer(address(0), initialHolder, tHolder);
@@ -124,6 +130,11 @@ contract PureReflectionToken is IERC20 {
 
         uint256 rAmount = tAmount * rate;
         uint256 rFee = tFee * rate;
+        if (_rTotal - rFee < _tTotal) {
+            rFee = _rTotal - _tTotal;
+            tFee = rFee / rate;
+            tTransfer = tAmount - tFee;
+        }
         uint256 rTransfer = rAmount - rFee;
 
         _rOwned[from] -= rAmount;
@@ -137,6 +148,7 @@ contract PureReflectionToken is IERC20 {
     }
 
     function _getRate() internal view returns (uint256) {
-        return _rTotal / _tTotal;
+        uint256 rate = _rTotal / _tTotal;
+        return rate == 0 ? 1 : rate;
     }
 }

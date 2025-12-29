@@ -5,6 +5,20 @@ import "forge-std/Test.sol";
 
 import {PureReflectionToken, IERC20} from "../src/PureReflectionToken.sol";
 
+contract PureReflectionTokenHarness is PureReflectionToken {
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_,
+        uint256 totalSupplyTokens,
+        address initialHolder
+    ) PureReflectionToken(name_, symbol_, decimals_, totalSupplyTokens, initialHolder) {}
+
+    function exposedGetRate() external view returns (uint256) {
+        return _getRate();
+    }
+}
+
 contract PureReflectionTokenTest is Test {
     PureReflectionToken private token;
 
@@ -63,6 +77,24 @@ contract PureReflectionTokenTest is Test {
         assertEq(deployed.balanceOf(deployed.DEAD()), DEAD_SUPPLY);
     }
 
+    function testDeploymentMergesDeadHolderAllocation() public {
+        address dead = token.DEAD();
+
+        vm.expectEmit(true, true, true, true);
+        emit IERC20.Transfer(address(0), dead, DEAD_SUPPLY);
+        vm.expectEmit(true, true, true, true);
+        emit IERC20.Transfer(address(0), dead, HOLDER_SUPPLY);
+        PureReflectionToken deployed = new PureReflectionToken("Basalt", "BSLT", 18, TOTAL_SUPPLY, dead);
+
+        assertEq(deployed.totalSupply(), TOTAL_SUPPLY);
+        assertEq(deployed.balanceOf(dead), TOTAL_SUPPLY);
+    }
+
+    function testDeploymentRevertsOnZeroSupply() public {
+        vm.expectRevert(abi.encodeWithSelector(PureReflectionToken.ZeroTotalSupply.selector));
+        new PureReflectionToken("Token", "TKN", 18, 0, initialHolder);
+    }
+
     function testApproveAndTransferFrom() public {
         uint256 amount = 50e18;
         uint256 spend = 20e18;
@@ -77,6 +109,35 @@ contract PureReflectionTokenTest is Test {
         token.transferFrom(initialHolder, alice, spend);
 
         assertEq(token.allowance(initialHolder, spender), amount - spend);
+    }
+
+    function testGetRateNeverReturnsZero() public {
+        PureReflectionTokenHarness harness =
+            new PureReflectionTokenHarness("Basalt", "BSLT", 18, TOTAL_SUPPLY, initialHolder);
+
+        vm.store(address(harness), bytes32(uint256(2)), bytes32(uint256(0)));
+        assertEq(harness.exposedGetRate(), 1);
+    }
+
+    function testFeeCapsAtReflectionFloor() public {
+        uint256 tTotal = token.totalSupply();
+        uint256 rTotal = tTotal + 5;
+
+        vm.store(address(token), bytes32(uint256(2)), bytes32(rTotal));
+
+        bytes32 holderSlot = keccak256(abi.encode(initialHolder, uint256(3)));
+        vm.store(address(token), holderSlot, bytes32(rTotal));
+
+        uint256 amount = 100e18;
+        uint256 expectedTransfer = amount - 5;
+
+        vm.expectEmit(true, true, true, true);
+        emit IERC20.Transfer(initialHolder, alice, expectedTransfer);
+        vm.prank(initialHolder);
+        token.transfer(alice, amount);
+
+        uint256 rTotalAfter = uint256(vm.load(address(token), bytes32(uint256(2))));
+        assertEq(rTotalAfter, tTotal);
     }
 
     function testTransferFromRevertsWhenAllowanceExceeded() public {
