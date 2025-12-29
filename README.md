@@ -2,6 +2,10 @@
 
 Basalt is a minimal, ownerless ERC20 that implements **pure reflections**. Every transfer pays a 1% fee that is redistributed to **all holders**, including the burn address. There are **no buybacks, swaps, or liquidity logic** in the contract, so it behaves like a standard ERC20 that can be paired with any asset.
 
+## WARNING
+
+DEX pairs receive reflections and their balances can change without transfers; integrators must account for reflection-token AMM behavior.
+
 ## Tokenomics
 
 - **Name:** Basalt
@@ -9,9 +13,7 @@ Basalt is a minimal, ownerless ERC20 that implements **pure reflections**. Every
 - **Decimals:** 18
 - **Total supply:** 1000e18 (1,000 tokens)
 - **Reflection fee:** 1% on every transfer (no external tax wallet)
-- **Initial distribution:**
-  - 90% minted to `0xdead` (burn address)
-  - 10% minted to the initial holder (deployer-provided EOA)
+- **Initial distribution:** 100% minted to the initial holder (deployer-provided EOA)
 - **No exclusions:** every address receives reflections
 
 ## Requirements
@@ -36,7 +38,7 @@ forge test -vvv
 
 ## Deployment
 
-The deploy script reads `INITIAL_HOLDER` from the environment and defaults to the broadcaster if not set.
+The deploy script reads `INITIAL_HOLDER` from the environment, otherwise derives the holder from `PRIVATE_KEY`.
 
 ```bash
 export INITIAL_HOLDER=0xYourEOA

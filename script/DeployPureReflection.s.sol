@@ -10,8 +10,14 @@ contract DeployPureReflection is Script {
     function run() external {
         vm.startBroadcast();
 
-        address broadcaster = tx.origin;
-        address initialHolder = vm.envOr("INITIAL_HOLDER", broadcaster);
+        address initialHolder;
+        if (vm.envExists("INITIAL_HOLDER")) {
+            initialHolder = vm.envAddress("INITIAL_HOLDER");
+        } else if (vm.envExists("PRIVATE_KEY")) {
+            initialHolder = vm.addr(vm.envUint("PRIVATE_KEY"));
+        } else {
+            revert("Set INITIAL_HOLDER or PRIVATE_KEY");
+        }
 
         PureReflectionToken token = new PureReflectionToken("Basalt", "BSLT", 18, 1000e18, initialHolder);
 
@@ -19,8 +25,7 @@ contract DeployPureReflection is Script {
         console2.log("DEAD balance:", token.balanceOf(token.DEAD()));
         console2.log("Initial holder balance:", token.balanceOf(initialHolder));
 
-        require(token.balanceOf(token.DEAD()) == 900e18, "DEAD balance mismatch");
-        require(token.balanceOf(initialHolder) == 100e18, "holder balance mismatch");
+        require(token.balanceOf(initialHolder) == 1000e18, "holder balance mismatch");
 
         vm.stopBroadcast();
     }
