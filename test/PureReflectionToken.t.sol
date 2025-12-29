@@ -90,6 +90,20 @@ contract PureReflectionTokenTest is Test {
         assertEq(deployed.balanceOf(dead), TOTAL_SUPPLY);
     }
 
+    function testDeploymentDeadHolderAllowsTransfer() public {
+        address dead = token.DEAD();
+        PureReflectionToken deployed = new PureReflectionToken("Basalt", "BSLT", 18, TOTAL_SUPPLY, dead);
+
+        assertEq(deployed.totalSupply(), TOTAL_SUPPLY);
+        assertEq(deployed.balanceOf(dead), TOTAL_SUPPLY);
+
+        vm.prank(dead);
+        deployed.transfer(alice, 1e18);
+
+        assertGt(deployed.balanceOf(alice), 0);
+        assertLt(deployed.balanceOf(dead), TOTAL_SUPPLY);
+    }
+
     function testDeploymentRevertsOnZeroSupply() public {
         vm.expectRevert(abi.encodeWithSelector(PureReflectionToken.ZeroTotalSupply.selector));
         new PureReflectionToken("Token", "TKN", 18, 0, initialHolder);
@@ -138,6 +152,26 @@ contract PureReflectionTokenTest is Test {
 
         uint256 rTotalAfter = uint256(vm.load(address(token), bytes32(uint256(2))));
         assertEq(rTotalAfter, tTotal);
+    }
+
+    function testTransferDoesNotBrickWhenRateHitsFloor() public {
+        address holder = makeAddr("holder");
+        PureReflectionTokenHarness harness = new PureReflectionTokenHarness("Basalt", "BSLT", 18, TOTAL_SUPPLY, holder);
+
+        uint256 tTotal = harness.totalSupply();
+        vm.store(address(harness), bytes32(uint256(2)), bytes32(tTotal));
+
+        bytes32 holderSlot = keccak256(abi.encode(holder, uint256(3)));
+        vm.store(address(harness), holderSlot, bytes32(tTotal));
+
+        vm.prank(holder);
+        harness.transfer(alice, 1e18);
+
+        uint256 rTotalAfter = uint256(vm.load(address(harness), bytes32(uint256(2))));
+        assertGe(harness.exposedGetRate(), 1);
+        assertGe(rTotalAfter, tTotal);
+        assertGt(harness.balanceOf(holder), 0);
+        assertGt(harness.balanceOf(alice), 0);
     }
 
     function testTransferFromRevertsWhenAllowanceExceeded() public {
