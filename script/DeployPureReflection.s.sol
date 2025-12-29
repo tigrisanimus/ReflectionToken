@@ -25,12 +25,7 @@ contract DeployPureReflection is Script {
         console2.log("DEAD balance:", token.balanceOf(token.DEAD()));
         console2.log("Initial holder balance:", token.balanceOf(initialHolder));
 
-        if (initialHolder == token.DEAD()) {
-            require(token.balanceOf(token.DEAD()) == 1000e18, "DEAD balance mismatch");
-        } else {
-            require(token.balanceOf(token.DEAD()) == 900e18, "DEAD balance mismatch");
-            require(token.balanceOf(initialHolder) == 100e18, "holder balance mismatch");
-        }
+        require(token.balanceOf(initialHolder) == 1000e18, "holder balance mismatch");
 
         vm.stopBroadcast();
     }

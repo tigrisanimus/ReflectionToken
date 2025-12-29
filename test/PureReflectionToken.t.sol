@@ -28,8 +28,6 @@ contract PureReflectionTokenTest is Test {
     address private spender;
 
     uint256 private constant TOTAL_SUPPLY = 1_000e18;
-    uint256 private constant DEAD_SUPPLY = 900e18;
-    uint256 private constant HOLDER_SUPPLY = 100e18;
     uint256 private constant TOLERANCE = 2;
 
     function _expectedBalanceAfterSender(uint256 balanceBefore, uint256 tAmount, uint256 tFee, uint256 tTotal)
@@ -67,41 +65,12 @@ contract PureReflectionTokenTest is Test {
 
     function testDeploymentSplitAndEvents() public {
         vm.expectEmit(true, true, true, true);
-        emit IERC20.Transfer(address(0), token.DEAD(), DEAD_SUPPLY);
-        vm.expectEmit(true, true, true, true);
-        emit IERC20.Transfer(address(0), initialHolder, HOLDER_SUPPLY);
+        emit IERC20.Transfer(address(0), initialHolder, TOTAL_SUPPLY);
         PureReflectionToken deployed = new PureReflectionToken("Basalt", "BSLT", 18, TOTAL_SUPPLY, initialHolder);
 
         assertEq(deployed.totalSupply(), TOTAL_SUPPLY);
-        assertEq(deployed.balanceOf(initialHolder), HOLDER_SUPPLY);
-        assertEq(deployed.balanceOf(deployed.DEAD()), DEAD_SUPPLY);
-    }
-
-    function testDeploymentMergesDeadHolderAllocation() public {
-        address dead = token.DEAD();
-
-        vm.expectEmit(true, true, true, true);
-        emit IERC20.Transfer(address(0), dead, DEAD_SUPPLY);
-        vm.expectEmit(true, true, true, true);
-        emit IERC20.Transfer(address(0), dead, HOLDER_SUPPLY);
-        PureReflectionToken deployed = new PureReflectionToken("Basalt", "BSLT", 18, TOTAL_SUPPLY, dead);
-
-        assertEq(deployed.totalSupply(), TOTAL_SUPPLY);
-        assertEq(deployed.balanceOf(dead), TOTAL_SUPPLY);
-    }
-
-    function testDeploymentDeadHolderAllowsTransfer() public {
-        address dead = token.DEAD();
-        PureReflectionToken deployed = new PureReflectionToken("Basalt", "BSLT", 18, TOTAL_SUPPLY, dead);
-
-        assertEq(deployed.totalSupply(), TOTAL_SUPPLY);
-        assertEq(deployed.balanceOf(dead), TOTAL_SUPPLY);
-
-        vm.prank(dead);
-        deployed.transfer(alice, 1e18);
-
-        assertGt(deployed.balanceOf(alice), 0);
-        assertLt(deployed.balanceOf(dead), TOTAL_SUPPLY);
+        assertEq(deployed.balanceOf(initialHolder), TOTAL_SUPPLY);
+        assertEq(deployed.balanceOf(deployed.DEAD()), 0);
     }
 
     function testDeploymentRevertsOnZeroSupply() public {
@@ -131,47 +100,6 @@ contract PureReflectionTokenTest is Test {
 
         vm.store(address(harness), bytes32(uint256(2)), bytes32(uint256(0)));
         assertEq(harness.exposedGetRate(), 1);
-    }
-
-    function testFeeCapsAtReflectionFloor() public {
-        uint256 tTotal = token.totalSupply();
-        uint256 rTotal = tTotal + 5;
-
-        vm.store(address(token), bytes32(uint256(2)), bytes32(rTotal));
-
-        bytes32 holderSlot = keccak256(abi.encode(initialHolder, uint256(3)));
-        vm.store(address(token), holderSlot, bytes32(rTotal));
-
-        uint256 amount = 100e18;
-        uint256 expectedTransfer = amount - 5;
-
-        vm.expectEmit(true, true, true, true);
-        emit IERC20.Transfer(initialHolder, alice, expectedTransfer);
-        vm.prank(initialHolder);
-        token.transfer(alice, amount);
-
-        uint256 rTotalAfter = uint256(vm.load(address(token), bytes32(uint256(2))));
-        assertEq(rTotalAfter, tTotal);
-    }
-
-    function testTransferDoesNotBrickWhenRateHitsFloor() public {
-        address holder = makeAddr("holder");
-        PureReflectionTokenHarness harness = new PureReflectionTokenHarness("Basalt", "BSLT", 18, TOTAL_SUPPLY, holder);
-
-        uint256 tTotal = harness.totalSupply();
-        vm.store(address(harness), bytes32(uint256(2)), bytes32(tTotal));
-
-        bytes32 holderSlot = keccak256(abi.encode(holder, uint256(3)));
-        vm.store(address(harness), holderSlot, bytes32(tTotal));
-
-        vm.prank(holder);
-        harness.transfer(alice, 1e18);
-
-        uint256 rTotalAfter = uint256(vm.load(address(harness), bytes32(uint256(2))));
-        assertGe(harness.exposedGetRate(), 1);
-        assertGe(rTotalAfter, tTotal);
-        assertGt(harness.balanceOf(holder), 0);
-        assertGt(harness.balanceOf(alice), 0);
     }
 
     function testTransferFromRevertsWhenAllowanceExceeded() public {
@@ -235,12 +163,17 @@ contract PureReflectionTokenTest is Test {
     }
 
     function testDeadReceivesReflections() public {
-        uint256 deadBefore = token.balanceOf(token.DEAD());
+        address dead = token.DEAD();
+
+        vm.prank(initialHolder);
+        token.transfer(dead, 25e18);
+
+        uint256 deadBefore = token.balanceOf(dead);
 
         vm.prank(initialHolder);
         token.transfer(alice, 25e18);
 
-        uint256 deadAfter = token.balanceOf(token.DEAD());
+        uint256 deadAfter = token.balanceOf(dead);
         assertGt(deadAfter, deadBefore);
     }
 

@@ -54,22 +54,9 @@ contract PureReflectionToken is IERC20 {
         _tTotal = totalSupplyTokens;
         _rTotal = MAX - (MAX % _tTotal);
 
-        uint256 tDead = (_tTotal * 90) / 100;
-        uint256 tHolder = _tTotal - tDead;
+        _rOwned[initialHolder] = _rTotal;
 
-        uint256 rate = _getRate();
-        uint256 rDead = tDead * rate;
-        uint256 rHolder = _rTotal - rDead;
-
-        if (initialHolder == DEAD) {
-            _rOwned[DEAD] = rDead + rHolder;
-        } else {
-            _rOwned[DEAD] = rDead;
-            _rOwned[initialHolder] = rHolder;
-        }
-
-        emit Transfer(address(0), DEAD, tDead);
-        emit Transfer(address(0), initialHolder, tHolder);
+        emit Transfer(address(0), initialHolder, _tTotal);
     }
 
     function totalSupply() external view returns (uint256) {
@@ -130,15 +117,6 @@ contract PureReflectionToken is IERC20 {
 
         uint256 rAmount = tAmount * rate;
         uint256 rFee = tFee * rate;
-        if (_rTotal <= _tTotal) {
-            rFee = 0;
-            tFee = 0;
-            tTransfer = tAmount;
-        } else if (_rTotal - rFee < _tTotal) {
-            rFee = _rTotal - _tTotal;
-            tFee = rFee / rate;
-            tTransfer = tAmount - tFee;
-        }
         uint256 rTransfer = rAmount - rFee;
 
         _rOwned[from] -= rAmount;

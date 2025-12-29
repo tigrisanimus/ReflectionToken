@@ -13,9 +13,7 @@ DEX pairs receive reflections and their balances can change without transfers; i
 - **Decimals:** 18
 - **Total supply:** 1000e18 (1,000 tokens)
 - **Reflection fee:** 1% on every transfer (no external tax wallet)
-- **Initial distribution:**
-  - 90% minted to `0xdead` (burn address)
-  - 10% minted to the initial holder (deployer-provided EOA)
+- **Initial distribution:** 100% minted to the initial holder (deployer-provided EOA)
 - **No exclusions:** every address receives reflections
 
 ## Requirements
