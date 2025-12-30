@@ -112,12 +112,18 @@ contract PureReflectionToken is IERC20 {
 
         uint256 rate = _getRate();
 
-        uint256 tFee = (tAmount * FEE_BPS) / BPS_DENOM;
-        uint256 tTransfer = tAmount - tFee;
-
         uint256 rAmount = tAmount * rate;
-        uint256 rFee = tFee * rate;
+        uint256 rFee = ((tAmount * FEE_BPS) / BPS_DENOM) * rate;
+        if (_rTotal <= _tTotal) {
+            rFee = 0;
+        } else {
+            uint256 maxRFee = _rTotal - _tTotal;
+            if (rFee > maxRFee) {
+                rFee = maxRFee;
+            }
+        }
         uint256 rTransfer = rAmount - rFee;
+        uint256 tTransfer = rTransfer / rate;
 
         _rOwned[from] -= rAmount;
         _rOwned[to] += rTransfer;
